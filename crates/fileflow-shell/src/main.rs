@@ -14,7 +14,7 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 
 use fileflow_client::{ClientError, FileFlowClient};
-use fileflow_core::{LogicalFileId, LogicalFileView, SearchHit};
+use fileflow_core::{LogicalFileId, LogicalFileView, RevisionInfo, SearchHit};
 use fileflow_rpc::IndexReport;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
@@ -129,6 +129,7 @@ struct FileFlowApp {
     tag_input: String,
     note_draft: String,
     todo_input: String,
+    revisions: Vec<RevisionInfo>,
 }
 
 impl FileFlowApp {
@@ -145,6 +146,7 @@ impl FileFlowApp {
             tag_input: String::new(),
             note_draft: String::new(),
             todo_input: String::new(),
+            revisions: Vec::new(),
         };
         app.reconnect();
         app
@@ -210,13 +212,23 @@ impl FileFlowApp {
         };
         match self.rt.block_on(async {
             let mut c = client.lock().await;
-            c.get_file(id).await
+            let file = c.get_file(id).await?;
+            let revs = if file.is_some() {
+                c.list_revisions(id).await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            Ok::<_, ClientError>((file, revs))
         }) {
-            Ok(Some(view)) => {
+            Ok((Some(view), revs)) => {
                 self.note_draft = view.note.clone();
                 self.detail = Some(view);
+                self.revisions = revs;
             }
-            Ok(None) => self.status = "File not found".into(),
+            Ok((None, _)) => {
+                self.status = "File not found".into();
+                self.revisions.clear();
+            }
             Err(err) => self.status = format!("Error: {err}"),
         }
     }
@@ -335,6 +347,10 @@ impl FileFlowApp {
         let mut toggle_todo = None;
         let mut open_path: Option<String> = None;
         let mut reveal_path: Option<String> = None;
+        let mut vault_toggle: Option<bool> = None;
+        let mut make_current: Option<i64> = None;
+        let mut export_rev: Option<i64> = None;
+        let mut verify_rev: Option<i64> = None;
 
         egui::SidePanel::left("results")
             .resizable(true)
@@ -429,6 +445,45 @@ impl FileFlowApp {
                     add_todo = true;
                 }
             });
+
+            ui.separator();
+            ui.label("Vault / versions");
+            let mut vaulted = view.vaulted;
+            if ui
+                .checkbox(&mut vaulted, "Vault this file (keep immutable revisions)")
+                .changed()
+            {
+                vault_toggle = Some(vaulted);
+            }
+            ui.label("Select which revision should become current. Other versions are kept.");
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    for rev in &self.revisions {
+                        let mark = if rev.is_current { " (current)" } else { "" };
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!(
+                                "#{}  {}  {}  {} bytes{mark}",
+                                rev.revision_id,
+                                format_unix_utc(rev.created_at),
+                                &rev.sha256[..rev.sha256.len().min(12)],
+                                rev.size
+                            ));
+                            if ui.small_button("Make current").clicked() {
+                                make_current = Some(rev.revision_id);
+                            }
+                            if ui.small_button("Export…").clicked() {
+                                export_rev = Some(rev.revision_id);
+                            }
+                            if ui.small_button("Verify").clicked() {
+                                verify_rev = Some(rev.revision_id);
+                            }
+                        });
+                    }
+                });
+            if self.revisions.is_empty() {
+                ui.label("No revisions listed. Vault the file to store content objects.");
+            }
         });
 
         if let Some(id) = clicked {
@@ -476,6 +531,87 @@ impl FileFlowApp {
                     });
                     self.select_file(id);
                 }
+                if let Some(on) = vault_toggle {
+                    let result = self.rt.block_on(async {
+                        let mut c = client.lock().await;
+                        if on {
+                            c.add_to_vault(id).await
+                        } else {
+                            c.remove_from_vault(id).await
+                        }
+                    });
+                    match result {
+                        Ok(()) => {
+                            self.status = if on {
+                                "File vaulted; current content stored as an immutable object."
+                                    .into()
+                            } else {
+                                "Vault membership removed; historical objects are kept until prune."
+                                    .into()
+                            };
+                        }
+                        Err(err) => self.status = format!("Vault failed: {err}"),
+                    }
+                    self.select_file(id);
+                }
+                if let Some(rev) = make_current {
+                    let result = self.rt.block_on(async {
+                        let mut c = client.lock().await;
+                        c.set_current_revision(id, rev).await
+                    });
+                    match result {
+                        Ok(()) => {
+                            self.status = format!(
+                                "Revision {rev} is now current (bytes restored to the current path when possible)."
+                            );
+                        }
+                        Err(err) => self.status = format!("Make current failed: {err}"),
+                    }
+                    self.select_file(id);
+                }
+                if let Some(rev) = export_rev {
+                    let dest = self.detail.as_ref().and_then(|v| v.paths.first()).map(|p| {
+                        let path = std::path::Path::new(p);
+                        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                        let ext = path
+                            .extension()
+                            .map(|e| format!(".{}", e.to_string_lossy()))
+                            .unwrap_or_default();
+                        path.parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .join(format!("{stem}.r{rev}{ext}"))
+                            .display()
+                            .to_string()
+                    });
+                    if let Some(dest) = dest {
+                        let result = self.rt.block_on(async {
+                            let mut c = client.lock().await;
+                            c.export_revision(id, rev, &dest).await
+                        });
+                        match result {
+                            Ok(()) => self.status = format!("Exported revision {rev} to {dest}"),
+                            Err(err) => self.status = format!("Export failed: {err}"),
+                        }
+                    } else {
+                        self.status = "Export needs a current path.".into();
+                    }
+                }
+                if let Some(rev) = verify_rev {
+                    let result = self.rt.block_on(async {
+                        let mut c = client.lock().await;
+                        c.verify_revision(id, rev).await
+                    });
+                    match result {
+                        Ok(report) => {
+                            self.status = format!(
+                                "Verify revision {rev}: {} ({})",
+                                if report.ok { "ok" } else { "FAILED" },
+                                report.message
+                            );
+                        }
+                        Err(err) => self.status = format!("Verify failed: {err}"),
+                    }
+                }
             }
         }
         if let Some(path) = open_path {
@@ -487,6 +623,35 @@ impl FileFlowApp {
             reveal(&path);
         }
     }
+}
+
+fn format_unix_utc(secs: i64) -> String {
+    if secs < 0 {
+        return secs.to_string();
+    }
+    let secs = secs as u64;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let hour = rem / 3_600;
+    let min = (rem % 3_600) / 60;
+    let sec = rem % 60;
+    let (year, month, day) = civil_from_days(days as i64);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Howard Hinnant civil-from-days (days since Unix epoch).
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
 }
 
 fn pick_folder() -> Option<String> {
@@ -586,5 +751,11 @@ mod tests {
             "UI must not depend on the catalog crate"
         );
         assert!(manifest.contains("fileflow-client"));
+    }
+
+    #[test]
+    fn unix_utc_formats_epoch() {
+        assert_eq!(super::format_unix_utc(0), "1970-01-01 00:00:00Z");
+        assert_eq!(super::format_unix_utc(86_400), "1970-01-02 00:00:00Z");
     }
 }

@@ -198,6 +198,130 @@ impl<S: AsyncRead + AsyncWrite + Unpin> FileFlowClient<S> {
         }
     }
 
+    pub async fn add_to_vault(
+        &mut self,
+        logical_file_id: LogicalFileId,
+    ) -> Result<(), ClientError> {
+        self.expect_ok(Request::AddToVault { logical_file_id })
+            .await
+    }
+
+    pub async fn remove_from_vault(
+        &mut self,
+        logical_file_id: LogicalFileId,
+    ) -> Result<(), ClientError> {
+        self.expect_ok(Request::RemoveFromVault { logical_file_id })
+            .await
+    }
+
+    pub async fn list_revisions(
+        &mut self,
+        logical_file_id: LogicalFileId,
+    ) -> Result<Vec<fileflow_core::RevisionInfo>, ClientError> {
+        match self
+            .conn
+            .call(&Request::ListRevisions { logical_file_id })
+            .await?
+        {
+            Response::Revisions { revisions } => Ok(revisions),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn get_revision(
+        &mut self,
+        logical_file_id: LogicalFileId,
+        revision_id: i64,
+    ) -> Result<fileflow_core::RevisionInfo, ClientError> {
+        match self
+            .conn
+            .call(&Request::GetRevision {
+                logical_file_id,
+                revision_id,
+            })
+            .await?
+        {
+            Response::Revision { revision } => Ok(revision),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn prune_revisions(
+        &mut self,
+        logical_file_id: LogicalFileId,
+        keep_last: u32,
+    ) -> Result<(), ClientError> {
+        self.expect_ok(Request::PruneRevisions {
+            logical_file_id,
+            keep_last,
+        })
+        .await
+    }
+
+    pub async fn set_current_revision(
+        &mut self,
+        logical_file_id: LogicalFileId,
+        revision_id: i64,
+    ) -> Result<(), ClientError> {
+        self.expect_ok(Request::SetCurrentRevision {
+            logical_file_id,
+            revision_id,
+        })
+        .await
+    }
+
+    pub async fn export_revision(
+        &mut self,
+        logical_file_id: LogicalFileId,
+        revision_id: i64,
+        dest_path: &str,
+    ) -> Result<(), ClientError> {
+        self.expect_ok(Request::ExportRevision {
+            logical_file_id,
+            revision_id,
+            dest_path: dest_path.to_string(),
+        })
+        .await
+    }
+
+    pub async fn verify_revision(
+        &mut self,
+        logical_file_id: LogicalFileId,
+        revision_id: i64,
+    ) -> Result<fileflow_core::IntegrityReport, ClientError> {
+        match self
+            .conn
+            .call(&Request::VerifyRevision {
+                logical_file_id,
+                revision_id,
+            })
+            .await?
+        {
+            Response::Integrity { report } => Ok(report),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn verify_content_object(
+        &mut self,
+        sha256: &str,
+    ) -> Result<fileflow_core::IntegrityReport, ClientError> {
+        match self
+            .conn
+            .call(&Request::VerifyContentObject {
+                sha256: sha256.to_string(),
+            })
+            .await?
+        {
+            Response::Integrity { report } => Ok(report),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
     async fn expect_ok(&mut self, req: Request) -> Result<(), ClientError> {
         match self.conn.call(&req).await? {
             Response::Ok => Ok(()),

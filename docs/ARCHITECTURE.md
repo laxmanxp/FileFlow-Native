@@ -13,12 +13,12 @@ Logical File
 
 ## Authority
 
-**FileFlowService is the sole authority over persistent SQLite/catalog state.**
+**FileFlowService is the sole authority over persistent SQLite/catalog state and vault blobs.**
 
 - Only `fileflow-catalog` links `rusqlite`.
-- Only the service process opens `catalog.sqlite`.
-- `fileflow-shell` and `fileflow-client` never open the database for reads or writes.
-- UI mutations go through RPC (`AddTag`, `SetNote`, `AddTodo`, …).
+- Only the service process opens `catalog.sqlite` and writes `$FILEFLOW_DATA_HOME/vault/`.
+- `fileflow-shell` and `fileflow-client` never open the database or vault objects.
+- UI mutations go through RPC (`AddTag`, `AddToVault`, `SetCurrentRevision`, …).
 
 ## Identity
 
@@ -52,6 +52,33 @@ The UI never watches the disk. RPC: `GetWatcherStatus`, `PauseWatcher`, `ResumeW
 
 Windows: `ReadDirectoryChangesW` is noisy and often emits remove+create instead of a native rename; the service pairs a same-directory delete+create in one debounce window as a rename. Prefer a slightly longer quiet period if a save-to-temp workflow mis-pairs.
 
+## Vault and versions
+
+Ordinary indexed files are **metadata only** (path, tags, notes, todos, and a catalog hash/revision row). **Vaulted** files also persist immutable content objects.
+
+Layout:
+
+```
+$FILEFLOW_DATA_HOME/
+  catalog.sqlite
+  vault/objects/{aa}/{bb}/{sha256}
+```
+
+`aa`/`bb` are the first four hex characters of the SHA-256. Blob copy is streamed (64 KiB); hashing and blob I/O happen **outside** catalog transactions.
+
+| RPC | Behavior |
+| --- | --- |
+| `AddToVault` | Mark vaulted; stream current path into CAS if readable; ensure a current revision. |
+| `RemoveFromVault` | Clear membership. Historical objects remain until prune. |
+| Watcher/Index hash change (vaulted) | Store new object if absent; append revision; update current pointer. |
+| `ListRevisions` / `GetRevision` | Metadata: id, hash, size, timestamp, current flag, blob present. |
+| `SetCurrentRevision` | Select which revision is current **and** restore bytes to the current path (temp + rename). Does not delete other versions. |
+| `ExportRevision` | Write bytes to a destination path without changing current. |
+| `PruneRevisions(keep_last)` | Keep last N plus the current revision. Default policy is keep-forever (`vault_keep_last` NULL). |
+| `VerifyRevision` / `VerifyContentObject` | Re-hash the blob and compare. |
+
+Revisions belong to `logical_file_id`. Tombstoned paths keep revision history. Restore can fail if the destination is locked by Excel/Photoshop/etc.
+
 ## IPC
 
 Client/server **stub** pattern:
@@ -65,9 +92,10 @@ Client/server **stub** pattern:
 
 ```
 fileflow-shell  --RPC-->  fileflow-service  --owns-->  catalog.sqlite
+                                          --owns-->  vault/objects/…
 fileflow-client  (same stub)
 ```
 
-## Out of scope (v0+)
+## Out of scope (v1)
 
-Full vault UX, Explorer shell extension/NSIS, cloud backup, Office preview parsers, duplicate-manager UX.
+Encrypted vault, cloud backup/`.ffbackup`, Explorer shell extension/NSIS, Office/CAD preview workers, duplicate-manager UX, email transport.

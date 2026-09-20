@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fileflow_core::{parse_search, LogicalFileId, LogicalFileView, SearchHit, TodoItem};
+use fileflow_core::{
+    parse_search, LogicalFileId, LogicalFileView, RevisionInfo, SearchHit, TodoItem,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::schema::migrate;
@@ -98,18 +100,56 @@ impl Catalog {
             id
         };
 
-        let latest: Option<String> = tx
+        let current_hash: Option<String> = tx
             .query_row(
-                "SELECT sha256 FROM revisions WHERE logical_file_id = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT r.sha256 FROM logical_files lf
+                 JOIN revisions r ON r.id = lf.current_revision_id
+                 WHERE lf.id = ?1",
                 params![id],
                 |row| row.get(0),
             )
             .optional()?;
-        if latest.as_deref() != Some(sha256) {
+        let current_hash = match current_hash {
+            Some(h) => Some(h),
+            None => tx
+                .query_row(
+                    "SELECT sha256 FROM revisions WHERE logical_file_id = ?1 ORDER BY id DESC LIMIT 1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+        if current_hash.as_deref() != Some(sha256) {
             tx.execute(
                 "INSERT INTO revisions (logical_file_id, sha256, created_at) VALUES (?1, ?2, ?3)",
                 params![id, sha256, now],
             )?;
+            let rid = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE logical_files SET current_revision_id = ?1 WHERE id = ?2",
+                params![rid, id],
+            )?;
+        } else {
+            let cur: Option<i64> = tx.query_row(
+                "SELECT current_revision_id FROM logical_files WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if cur.is_none() {
+                let rid: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM revisions WHERE logical_file_id = ?1 AND sha256 = ?2 ORDER BY id DESC LIMIT 1",
+                        params![id, sha256],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(rid) = rid {
+                    tx.execute(
+                        "UPDATE logical_files SET current_revision_id = ?1 WHERE id = ?2",
+                        params![rid, id],
+                    )?;
+                }
+            }
         }
 
         tx.commit()?;
@@ -414,17 +454,31 @@ impl Catalog {
             }
         }
 
-        let content: Option<(String, i64)> = self
+        let content: Option<(Option<String>, Option<i64>, Option<i64>)> = self
             .conn
             .query_row(
-                "SELECT r.sha256, c.size FROM revisions r
-                 JOIN content_objects c ON c.sha256 = r.sha256
-                 WHERE r.logical_file_id = ?1
-                 ORDER BY r.id DESC LIMIT 1",
+                "SELECT r.sha256, c.size, lf.current_revision_id FROM logical_files lf
+                 LEFT JOIN revisions r ON r.id = COALESCE(
+                    lf.current_revision_id,
+                    (SELECT rr.id FROM revisions rr WHERE rr.logical_file_id = lf.id ORDER BY rr.id DESC LIMIT 1)
+                 )
+                 LEFT JOIN content_objects c ON c.sha256 = r.sha256
+                 WHERE lf.id = ?1",
                 params![id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
+
+        let vaulted: i64 = self.conn.query_row(
+            "SELECT vaulted FROM logical_files WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let keep: Option<i64> = self.conn.query_row(
+            "SELECT vault_keep_last FROM logical_files WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
 
         Ok(LogicalFileView {
             logical_file_id: id,
@@ -432,8 +486,11 @@ impl Catalog {
             tags,
             note,
             todos,
-            sha256: content.as_ref().map(|(s, _)| s.clone()),
-            size: content.map(|(_, n)| n as u64),
+            sha256: content.as_ref().and_then(|(s, _, _)| s.clone()),
+            size: content.as_ref().and_then(|(_, n, _)| n.map(|v| v as u64)),
+            vaulted: vaulted != 0,
+            current_revision_id: content.as_ref().and_then(|(_, _, id)| *id),
+            vault_keep_last: keep.map(|n| n as u32),
         })
     }
 
@@ -451,6 +508,146 @@ impl Catalog {
         } else {
             Ok(())
         }
+    }
+
+    pub fn set_vaulted(&mut self, id: LogicalFileId, vaulted: bool) -> Result<()> {
+        self.require_file(id)?;
+        let n = self.conn.execute(
+            "UPDATE logical_files SET vaulted = ?1, updated_at = ?2 WHERE id = ?3",
+            params![vaulted as i64, now_secs(), id],
+        )?;
+        if n == 0 {
+            return Err(CatalogError::NotFound(format!("logical_file {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn is_vaulted(&self, id: LogicalFileId) -> Result<bool> {
+        let v: i64 = self
+            .conn
+            .query_row(
+                "SELECT vaulted FROM logical_files WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|_| CatalogError::NotFound(format!("logical_file {id}")))?;
+        Ok(v != 0)
+    }
+
+    pub fn mark_blob_present(&mut self, sha256: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE content_objects SET blob_present = 1 WHERE sha256 = ?1",
+            params![sha256],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_revisions(&self, id: LogicalFileId) -> Result<Vec<RevisionInfo>> {
+        self.require_file(id)?;
+        let current: Option<i64> = self.conn.query_row(
+            "SELECT current_revision_id FROM logical_files WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.sha256, c.size, r.created_at, COALESCE(c.blob_present, 0)
+             FROM revisions r
+             JOIN content_objects c ON c.sha256 = r.sha256
+             WHERE r.logical_file_id = ?1
+             ORDER BY r.id DESC",
+        )?;
+        let rows = stmt.query_map(params![id], |row| {
+            let rid: i64 = row.get(0)?;
+            Ok(RevisionInfo {
+                revision_id: rid,
+                sha256: row.get(1)?,
+                size: row.get::<_, i64>(2)? as u64,
+                created_at: row.get(3)?,
+                is_current: Some(rid) == current,
+                blob_present: row.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_revision(&self, id: LogicalFileId, revision_id: i64) -> Result<RevisionInfo> {
+        let rows = self.list_revisions(id)?;
+        rows.into_iter()
+            .find(|r| r.revision_id == revision_id)
+            .ok_or_else(|| CatalogError::NotFound(format!("revision {revision_id}")))
+    }
+
+    pub fn set_current_revision(
+        &mut self,
+        id: LogicalFileId,
+        revision_id: i64,
+    ) -> Result<RevisionInfo> {
+        let info = self.get_revision(id, revision_id)?;
+        self.conn.execute(
+            "UPDATE logical_files SET current_revision_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![revision_id, now_secs(), id],
+        )?;
+        Ok(RevisionInfo {
+            is_current: true,
+            ..info
+        })
+    }
+
+    pub fn set_vault_keep_last(&mut self, id: LogicalFileId, keep_last: Option<u32>) -> Result<()> {
+        self.require_file(id)?;
+        self.conn.execute(
+            "UPDATE logical_files SET vault_keep_last = ?1 WHERE id = ?2",
+            params![keep_last.map(|n| n as i64), id],
+        )?;
+        Ok(())
+    }
+
+    /// Drop older revision rows except current and the newest `keep_last` ids.
+    /// Returns SHA-256 values that are no longer referenced by any revision (caller may delete blobs).
+    pub fn prune_revisions(&mut self, id: LogicalFileId, keep_last: u32) -> Result<Vec<String>> {
+        self.require_file(id)?;
+        let keep_last = keep_last.max(1);
+        let current: Option<i64> = self.conn.query_row(
+            "SELECT current_revision_id FROM logical_files WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM revisions WHERE logical_file_id = ?1 ORDER BY id DESC")?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut keep = std::collections::HashSet::new();
+        if let Some(c) = current {
+            keep.insert(c);
+        }
+        for rid in ids.iter().take(keep_last as usize) {
+            keep.insert(*rid);
+        }
+        let doomed: Vec<i64> = ids.into_iter().filter(|rid| !keep.contains(rid)).collect();
+        if doomed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self.conn.transaction()?;
+        for rid in &doomed {
+            tx.execute("DELETE FROM revisions WHERE id = ?1", params![rid])?;
+        }
+        tx.commit()?;
+        let mut unused = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT sha256 FROM content_objects WHERE blob_present = 1 AND sha256 NOT IN (SELECT sha256 FROM revisions)",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for r in rows {
+            unused.push(r?);
+        }
+        Ok(unused)
     }
 }
 
@@ -598,5 +795,54 @@ mod tests {
         assert_eq!(listed, vec![stored.clone()]);
         cat.remove_indexed_location(&stored).unwrap();
         assert!(cat.list_indexed_locations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_current_revision_does_not_drop_others() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("doc.txt");
+        std::fs::write(&path, b"v1").unwrap();
+        let p = path.to_str().unwrap();
+        let id = cat.upsert_indexed(p, "hash1", 2).unwrap();
+        cat.upsert_indexed(p, "hash2", 2).unwrap();
+        let revs = cat.list_revisions(id).unwrap();
+        assert_eq!(revs.len(), 2);
+        let older = revs.iter().find(|r| !r.is_current).unwrap().revision_id;
+        cat.set_current_revision(id, older).unwrap();
+        let view = cat.get_file(id).unwrap().unwrap();
+        assert_eq!(view.current_revision_id, Some(older));
+        assert_eq!(view.sha256.as_deref(), Some("hash1"));
+        assert_eq!(cat.list_revisions(id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prune_keeps_last_n_and_current() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("doc.txt");
+        std::fs::write(&path, b"v").unwrap();
+        let p = path.to_str().unwrap();
+        let id = cat.upsert_indexed(p, "h1", 1).unwrap();
+        cat.upsert_indexed(p, "h2", 1).unwrap();
+        cat.upsert_indexed(p, "h3", 1).unwrap();
+        cat.upsert_indexed(p, "h4", 1).unwrap();
+        let revs = cat.list_revisions(id).unwrap();
+        assert_eq!(revs.len(), 4);
+        let oldest = revs
+            .iter()
+            .min_by_key(|r| r.revision_id)
+            .unwrap()
+            .revision_id;
+        cat.set_current_revision(id, oldest).unwrap();
+        let _unused = cat.prune_revisions(id, 2).unwrap();
+        let left = cat.list_revisions(id).unwrap();
+        assert!(left.iter().any(|r| r.revision_id == oldest && r.is_current));
+        assert_eq!(left.len(), 3);
+        let hashes: Vec<&str> = left.iter().map(|r| r.sha256.as_str()).collect();
+        assert!(hashes.contains(&"h1"));
+        assert!(hashes.contains(&"h3"));
+        assert!(hashes.contains(&"h4"));
+        assert!(!hashes.contains(&"h2"));
     }
 }

@@ -74,6 +74,43 @@ pub enum Command {
         path: String,
         reply: Reply<Option<LogicalFileId>>,
     },
+    SetVaulted {
+        id: LogicalFileId,
+        vaulted: bool,
+        reply: Reply<()>,
+    },
+    IsVaulted {
+        id: LogicalFileId,
+        reply: Reply<bool>,
+    },
+    MarkBlobPresent {
+        sha256: String,
+        reply: Reply<()>,
+    },
+    ListRevisions {
+        id: LogicalFileId,
+        reply: Reply<Vec<fileflow_core::RevisionInfo>>,
+    },
+    GetRevision {
+        id: LogicalFileId,
+        revision_id: i64,
+        reply: Reply<fileflow_core::RevisionInfo>,
+    },
+    SetCurrentRevision {
+        id: LogicalFileId,
+        revision_id: i64,
+        reply: Reply<fileflow_core::RevisionInfo>,
+    },
+    SetVaultKeepLast {
+        id: LogicalFileId,
+        keep_last: Option<u32>,
+        reply: Reply<()>,
+    },
+    PruneRevisions {
+        id: LogicalFileId,
+        keep_last: u32,
+        reply: Reply<Vec<String>>,
+    },
 }
 
 pub fn spawn_writer(mut catalog: Catalog) -> mpsc::Sender<Command> {
@@ -138,6 +175,46 @@ pub fn spawn_writer(mut catalog: Catalog) -> mpsc::Sender<Command> {
                 }
                 Command::LookupAnyPath { path, reply } => {
                     let _ = reply.send(catalog.resolve_path_any(&path));
+                }
+                Command::SetVaulted { id, vaulted, reply } => {
+                    let _ = reply.send(catalog.set_vaulted(id, vaulted));
+                }
+                Command::IsVaulted { id, reply } => {
+                    let _ = reply.send(catalog.is_vaulted(id));
+                }
+                Command::MarkBlobPresent { sha256, reply } => {
+                    let _ = reply.send(catalog.mark_blob_present(&sha256));
+                }
+                Command::ListRevisions { id, reply } => {
+                    let _ = reply.send(catalog.list_revisions(id));
+                }
+                Command::GetRevision {
+                    id,
+                    revision_id,
+                    reply,
+                } => {
+                    let _ = reply.send(catalog.get_revision(id, revision_id));
+                }
+                Command::SetCurrentRevision {
+                    id,
+                    revision_id,
+                    reply,
+                } => {
+                    let _ = reply.send(catalog.set_current_revision(id, revision_id));
+                }
+                Command::SetVaultKeepLast {
+                    id,
+                    keep_last,
+                    reply,
+                } => {
+                    let _ = reply.send(catalog.set_vault_keep_last(id, keep_last));
+                }
+                Command::PruneRevisions {
+                    id,
+                    keep_last,
+                    reply,
+                } => {
+                    let _ = reply.send(catalog.prune_revisions(id, keep_last));
                 }
             }
         }

@@ -24,6 +24,10 @@ impl Config {
     pub fn catalog_path(&self) -> PathBuf {
         self.data_home.join("catalog.sqlite")
     }
+
+    pub fn vault_root(&self) -> PathBuf {
+        self.data_home.join("vault")
+    }
 }
 
 pub fn default_data_home() -> PathBuf {
@@ -79,5 +83,6 @@ mod tests {
             cfg.catalog_path(),
             PathBuf::from("/tmp/ff-test/catalog.sqlite")
         );
+        assert_eq!(cfg.vault_root(), PathBuf::from("/tmp/ff-test/vault"));
     }
 }

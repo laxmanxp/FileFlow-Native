@@ -23,9 +23,11 @@ pub async fn index_one_file(
         .await
         .map_err(|e| CatalogError::msg(e.to_string()))?
         .map_err(|e| CatalogError::msg(e.to_string()))?;
-    service
-        .upsert_indexed(path.to_string_lossy().into_owned(), sha256, size)
-        .await
+    let id = service
+        .upsert_indexed(path.to_string_lossy().into_owned(), sha256.clone(), size)
+        .await?;
+    service.capture_vault_blob(id, path, &sha256).await?;
+    Ok(id)
 }
 
 pub async fn index_path(

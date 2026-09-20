@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS indexed_locations (
 );
 "#;
 
+const MIGRATION_003: &str = r#"
+ALTER TABLE logical_files ADD COLUMN vaulted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE logical_files ADD COLUMN current_revision_id INTEGER;
+ALTER TABLE logical_files ADD COLUMN vault_keep_last INTEGER;
+ALTER TABLE content_objects ADD COLUMN blob_present INTEGER NOT NULL DEFAULT 0;
+"#;
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
@@ -94,6 +101,23 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     )?;
     if applied2 == 0 {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (2)", [])?;
+    }
+    let applied3: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM schema_migrations WHERE version = 3",
+        [],
+        |row| row.get(0),
+    )?;
+    if applied3 == 0 {
+        conn.execute_batch(MIGRATION_003)?;
+        conn.execute(
+            "UPDATE logical_files SET current_revision_id = (
+                SELECT r.id FROM revisions r
+                WHERE r.logical_file_id = logical_files.id
+                ORDER BY r.id DESC LIMIT 1
+            )",
+            [],
+        )?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (3)", [])?;
     }
     Ok(())
 }

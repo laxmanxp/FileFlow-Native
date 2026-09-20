@@ -21,6 +21,28 @@ pub struct LogicalFileView {
     pub todos: Vec<TodoItem>,
     pub sha256: Option<String>,
     pub size: Option<u64>,
+    pub vaulted: bool,
+    pub current_revision_id: Option<i64>,
+    /// `None` means keep every revision (default). `Some(n)` keeps last n plus current.
+    pub vault_keep_last: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevisionInfo {
+    pub revision_id: i64,
+    pub sha256: String,
+    pub size: u64,
+    pub created_at: i64,
+    pub is_current: bool,
+    pub blob_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrityReport {
+    pub ok: bool,
+    pub expected_sha256: String,
+    pub actual_sha256: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

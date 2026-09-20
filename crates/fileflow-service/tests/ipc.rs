@@ -16,7 +16,8 @@ async fn health_resolve_metadata_and_identity_over_uds() {
     let sock = dir.path().join("fileflow.sock");
     let db = dir.path().join("catalog.sqlite");
     let catalog = Catalog::open(&db).unwrap();
-    let service = FileFlowService::spawn(catalog);
+    let vault = dir.path().join("vault");
+    let service = FileFlowService::spawn(catalog, vault);
     let sock_serve = sock.clone();
     tokio::spawn(async move {
         let _ = serve(&sock_serve, service).await;

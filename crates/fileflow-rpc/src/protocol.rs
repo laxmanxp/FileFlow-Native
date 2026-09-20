@@ -1,4 +1,4 @@
-use fileflow_core::{LogicalFileId, LogicalFileView, SearchHit};
+use fileflow_core::{IntegrityReport, LogicalFileId, LogicalFileView, RevisionInfo, SearchHit};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +50,39 @@ pub enum Request {
     RemoveIndexedLocation {
         path: String,
     },
+    AddToVault {
+        logical_file_id: LogicalFileId,
+    },
+    RemoveFromVault {
+        logical_file_id: LogicalFileId,
+    },
+    ListRevisions {
+        logical_file_id: LogicalFileId,
+    },
+    GetRevision {
+        logical_file_id: LogicalFileId,
+        revision_id: i64,
+    },
+    SetCurrentRevision {
+        logical_file_id: LogicalFileId,
+        revision_id: i64,
+    },
+    ExportRevision {
+        logical_file_id: LogicalFileId,
+        revision_id: i64,
+        dest_path: String,
+    },
+    PruneRevisions {
+        logical_file_id: LogicalFileId,
+        keep_last: u32,
+    },
+    VerifyRevision {
+        logical_file_id: LogicalFileId,
+        revision_id: i64,
+    },
+    VerifyContentObject {
+        sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +118,15 @@ pub enum Response {
     },
     IndexedLocations {
         roots: Vec<String>,
+    },
+    Revisions {
+        revisions: Vec<RevisionInfo>,
+    },
+    Revision {
+        revision: RevisionInfo,
+    },
+    Integrity {
+        report: IntegrityReport,
     },
     Ok,
     Error {

@@ -45,9 +45,11 @@ cargo run -p fileflow-shell
 1. **Add** — paste or Browse a folder, then Index (registers an indexed location and starts watching).  
 2. **Find** — search with free text plus `tag:`, `todo:`, `notes:`, `ext:`.  
 3. **Open** / **Reveal** the selected file.  
-4. **Edit** tags, notes, and todos (all keyed by `logical_file_id`).
+4. **Edit** tags, notes, todos. Optionally **Vault** the file to keep immutable content revisions; **Make current** restores a prior version to the current path.
 
 Creates, renames/moves, edits, and deletes under indexed folders update the catalog automatically. Delete **tombstones** the path (`is_current = 0`) but keeps the logical file and its tags/notes/todos. Pause/Resume watch from the shell or RPC.
+
+Vaulted files also store content under `$FILEFLOW_DATA_HOME/vault/objects/{aa}/{bb}/{sha256}`. Ordinary indexed files stay metadata-only. Removing vault membership does **not** delete historical blobs (use prune / keep-last-N). Default retention is **keep forever**. Restore uses temp+rename; it can fail if another app has the file locked.
 
 ## Run (Windows)
 
@@ -65,7 +67,7 @@ The default pipe name is `\\.\pipe\FileFlow`.
 
 | Variable | Meaning |
 | --- | --- |
-| `FILEFLOW_DATA_HOME` | Directory for `catalog.sqlite` |
+| `FILEFLOW_DATA_HOME` | Directory for `catalog.sqlite` and `vault/` |
 | `FILEFLOW_SOCKET` | Named pipe path (Windows) or Unix socket path (Linux/macOS) |
 
 Defaults: `%LOCALAPPDATA%\FileFlow` and `\\.\pipe\FileFlow` on Windows; `~/.local/share/fileflow` and `$XDG_RUNTIME_DIR/fileflow.sock` on Linux.
@@ -76,6 +78,7 @@ Defaults: `%LOCALAPPDATA%\FileFlow` and `\\.\pipe\FileFlow` on Windows; `~/.loca
 - Core: streaming SHA-256 for files larger than the hash buffer.  
 - Service: Health, ResolvePath, IndexFolder, tag/note/todo, and path rewrite over Linux UDS.  
 - Watcher: temp tree create/rename/modify/delete over Linux UDS (`notify` + debounce).  
+- Vault: AddToVault stores blob; modify appends revision; SetCurrentRevision restores bytes; verify detects tampering.  
 - Shell: manifest must not depend on `rusqlite` or `fileflow-catalog`.
 
 ## Architecture
