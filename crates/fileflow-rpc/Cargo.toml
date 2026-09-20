@@ -1,0 +1,14 @@
+[package]
+name = "fileflow-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "IPC protocol and swappable client/server transport stubs"
+
+[dependencies]
+fileflow-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

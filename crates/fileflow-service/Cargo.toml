@@ -1,0 +1,26 @@
+[package]
+name = "fileflow-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Per-user FileFlowService: catalog authority and IPC server"
+
+[dependencies]
+anyhow.workspace = true
+fileflow-catalog.workspace = true
+fileflow-core.workspace = true
+fileflow-rpc.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+fileflow-client.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "fileflow-service"
+path = "src/main.rs"

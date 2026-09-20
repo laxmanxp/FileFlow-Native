@@ -1,0 +1,29 @@
+[package]
+name = "fileflow-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Desktop UI for FileFlow (talks only to FileFlowService)"
+
+[dependencies]
+egui = "=0.27.2"
+egui-winit = { version = "=0.27.2", default-features = false }
+egui_glow = { version = "=0.27.2", default-features = false, features = ["winit"] }
+fileflow-client.workspace = true
+fileflow-core.workspace = true
+fileflow-rpc.workspace = true
+raw-window-handle = "=0.5.2"
+glow = "=0.13.1"
+glutin = "=0.31.2"
+glutin-winit = "=0.4.2"
+tokio.workspace = true
+winit = { version = "=0.29.15", default-features = false, features = ["x11", "rwh_05", "rwh_06"] }
+# Pin transitive crates so Cargo 1.83 can resolve (no edition 2024).
+cc = "=1.1.21"
+hashbrown = "=0.14.5"
+indexmap = "=2.2.6"
+
+[[bin]]
+name = "fileflow-shell"
+path = "src/main.rs"

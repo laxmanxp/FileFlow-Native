@@ -1,0 +1,17 @@
+[package]
+name = "fileflow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared types, hashing, search query parsing, and config for FileFlow"
+
+[dependencies]
+dirs.workspace = true
+hex.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

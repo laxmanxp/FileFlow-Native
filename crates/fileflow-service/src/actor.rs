@@ -1,0 +1,112 @@
+use fileflow_catalog::{Catalog, CatalogError};
+use fileflow_core::{LogicalFileId, LogicalFileView, SearchHit};
+use tokio::sync::{mpsc, oneshot};
+
+const QUEUE_BOUND: usize = 64;
+
+type Reply<T> = oneshot::Sender<Result<T, CatalogError>>;
+
+pub enum Command {
+    ResolvePath {
+        path: String,
+        reply: Reply<Option<LogicalFileId>>,
+    },
+    UpsertIndexed {
+        path: String,
+        sha256: String,
+        size: u64,
+        reply: Reply<LogicalFileId>,
+    },
+    UpdatePath {
+        id: LogicalFileId,
+        new_path: String,
+        reply: Reply<()>,
+    },
+    GetFile {
+        id: LogicalFileId,
+        reply: Reply<Option<LogicalFileView>>,
+    },
+    Search {
+        query: String,
+        reply: Reply<Vec<SearchHit>>,
+    },
+    AddTag {
+        id: LogicalFileId,
+        tag: String,
+        reply: Reply<()>,
+    },
+    RemoveTag {
+        id: LogicalFileId,
+        tag: String,
+        reply: Reply<()>,
+    },
+    SetNote {
+        id: LogicalFileId,
+        body: String,
+        reply: Reply<()>,
+    },
+    AddTodo {
+        id: LogicalFileId,
+        title: String,
+        reply: Reply<i64>,
+    },
+    SetTodoDone {
+        todo_id: i64,
+        done: bool,
+        reply: Reply<()>,
+    },
+}
+
+pub fn spawn_writer(mut catalog: Catalog) -> mpsc::Sender<Command> {
+    let (tx, mut rx) = mpsc::channel::<Command>(QUEUE_BOUND);
+    std::thread::spawn(move || {
+        while let Some(cmd) = rx.blocking_recv() {
+            match cmd {
+                Command::ResolvePath { path, reply } => {
+                    let _ = reply.send(catalog.resolve_path(&path));
+                }
+                Command::UpsertIndexed {
+                    path,
+                    sha256,
+                    size,
+                    reply,
+                } => {
+                    let _ = reply.send(catalog.upsert_indexed(&path, &sha256, size));
+                }
+                Command::UpdatePath {
+                    id,
+                    new_path,
+                    reply,
+                } => {
+                    let _ = reply.send(catalog.update_path(id, &new_path));
+                }
+                Command::GetFile { id, reply } => {
+                    let _ = reply.send(catalog.get_file(id));
+                }
+                Command::Search { query, reply } => {
+                    let _ = reply.send(catalog.search(&query));
+                }
+                Command::AddTag { id, tag, reply } => {
+                    let _ = reply.send(catalog.add_tag(id, &tag));
+                }
+                Command::RemoveTag { id, tag, reply } => {
+                    let _ = reply.send(catalog.remove_tag(id, &tag));
+                }
+                Command::SetNote { id, body, reply } => {
+                    let _ = reply.send(catalog.set_note(id, &body));
+                }
+                Command::AddTodo { id, title, reply } => {
+                    let _ = reply.send(catalog.add_todo(id, &title));
+                }
+                Command::SetTodoDone {
+                    todo_id,
+                    done,
+                    reply,
+                } => {
+                    let _ = reply.send(catalog.set_todo_done(todo_id, done));
+                }
+            }
+        }
+    });
+    tx
+}
