@@ -14,7 +14,7 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 
 use fileflow_client::{ClientError, FileFlowClient};
-use fileflow_core::{LogicalFileId, LogicalFileView, RevisionInfo, SearchHit};
+use fileflow_core::{DuplicateScan, LogicalFileId, LogicalFileView, RevisionInfo, SearchHit};
 use fileflow_rpc::IndexReport;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
@@ -130,6 +130,13 @@ struct FileFlowApp {
     note_draft: String,
     todo_input: String,
     revisions: Vec<RevisionInfo>,
+    tab_duplicates: bool,
+    dup_exclude: bool,
+    dup_min_size: String,
+    dup_scan: Option<DuplicateScan>,
+    dup_selected: Option<usize>,
+    dup_pending: Option<(String, LogicalFileId, Vec<LogicalFileId>)>,
+    dup_permanent: bool,
 }
 
 impl FileFlowApp {
@@ -147,6 +154,13 @@ impl FileFlowApp {
             note_draft: String::new(),
             todo_input: String::new(),
             revisions: Vec::new(),
+            tab_duplicates: false,
+            dup_exclude: true,
+            dup_min_size: String::new(),
+            dup_scan: None,
+            dup_selected: None,
+            dup_pending: None,
+            dup_permanent: false,
         };
         app.reconnect();
         app
@@ -297,7 +311,7 @@ impl FileFlowApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("FileFlow");
-                ui.label("Add → Find → Open → Edit metadata");
+                ui.label("Add → Find → Open → Edit metadata → Duplicates");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Reconnect").clicked() {
                         self.reconnect();
@@ -335,6 +349,10 @@ impl FileFlowApp {
                     self.run_search();
                 }
             });
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab_duplicates, false, "Find");
+                ui.selectable_value(&mut self.tab_duplicates, true, "Duplicates");
+            });
             ui.label(&self.status);
             ui.add_space(4.0);
         });
@@ -351,6 +369,11 @@ impl FileFlowApp {
         let mut make_current: Option<i64> = None;
         let mut export_rev: Option<i64> = None;
         let mut verify_rev: Option<i64> = None;
+
+        if self.tab_duplicates {
+            self.ui_duplicates(ctx);
+            return;
+        }
 
         egui::SidePanel::left("results")
             .resizable(true)
@@ -622,6 +645,214 @@ impl FileFlowApp {
         if let Some(path) = reveal_path {
             reveal(&path);
         }
+    }
+
+    fn run_duplicate_scan(&mut self) {
+        let Some(client) = self.client.clone() else {
+            self.status = "Not connected. Use Reconnect after starting the service.".into();
+            return;
+        };
+        let min_size = self.dup_min_size.trim().parse::<u64>().ok();
+        let exclude = self.dup_exclude;
+        match self.rt.block_on(async {
+            let mut c = client.lock().await;
+            c.find_duplicates(None, None, None, Some(exclude), min_size, Some(false))
+                .await
+        }) {
+            Ok(scan) => {
+                self.status = format!(
+                    "{} identical-content group(s); {} reclaimable (user-confirmed delete only; no Clean all)",
+                    scan.group_count,
+                    format_bytes(scan.reclaimable_bytes)
+                );
+                self.dup_scan = Some(scan);
+                self.dup_selected = None;
+                self.dup_pending = None;
+            }
+            Err(err) => self.status = format!("Duplicate scan failed: {err}"),
+        }
+    }
+
+    fn ui_duplicates(&mut self, ctx: &egui::Context) {
+        let mut scan_clicked = false;
+        let mut keep_choice: Option<(String, LogicalFileId, Vec<LogicalFileId>)> = None;
+        let mut confirm_go = false;
+        let mut cancel = false;
+        let mut select_group: Option<usize> = None;
+
+        egui::SidePanel::left("dup_groups")
+            .resizable(true)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.heading("Duplicate groups");
+                ui.label("Same SHA-256 → same content. You choose what to retain.");
+                ui.checkbox(
+                    &mut self.dup_exclude,
+                    "Exclude common build/VCS dirs (.git, node_modules, vendor, target, build, dist, .cache)",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Min size (bytes)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.dup_min_size)
+                            .desired_width(100.0)
+                            .hint_text("0"),
+                    );
+                    if ui.button("Scan catalog").clicked() {
+                        scan_clicked = true;
+                    }
+                });
+                if let Some(scan) = &self.dup_scan {
+                    ui.label(format!(
+                        "{} group(s) · {} members · {} reclaimable",
+                        scan.group_count,
+                        scan.member_count,
+                        format_bytes(scan.reclaimable_bytes)
+                    ));
+                    if !scan.exclude_patterns_applied.is_empty() {
+                        ui.label(format!(
+                            "Path-segment exclusions: {}",
+                            scan.exclude_patterns_applied.join(", ")
+                        ));
+                    }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (i, g) in scan.groups.iter().enumerate() {
+                            let n = g.members.len();
+                            let selected = self.dup_selected == Some(i);
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    format!(
+                                        "{n} identical files · {} · {}",
+                                        format_bytes(g.size),
+                                        format_bytes(g.reclaimable_bytes)
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                select_group = Some(i);
+                            }
+                        }
+                    });
+                } else {
+                    ui.label("Scan uses hashes already in the catalog (index a folder first).");
+                }
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Group members");
+            ui.label("Deletes are per-group and confirmed. There is no Clean all.");
+            ui.checkbox(
+                &mut self.dup_permanent,
+                "Permanent delete if trash/recycle is unavailable",
+            );
+            let Some(scan) = &self.dup_scan else {
+                ui.label("Run a scan to list groups.");
+                return;
+            };
+            let Some(idx) = self.dup_selected else {
+                ui.label("Select a group.");
+                return;
+            };
+            let Some(group) = scan.groups.get(idx) else {
+                return;
+            };
+            ui.monospace(format!("sha256: {}", group.sha256));
+            ui.label(format!(
+                "{} identical files found · size {} · reclaimable {}",
+                group.members.len(),
+                format_bytes(group.size),
+                format_bytes(group.reclaimable_bytes)
+            ));
+            for m in &group.members {
+                ui.horizontal(|ui| {
+                    ui.label(&m.path);
+                    if ui.small_button("Keep this").clicked() {
+                        let delete: Vec<_> = group
+                            .members
+                            .iter()
+                            .map(|x| x.logical_file_id)
+                            .filter(|id| *id != m.logical_file_id)
+                            .collect();
+                        keep_choice = Some((group.sha256.clone(), m.logical_file_id, delete));
+                    }
+                });
+            }
+            if let Some((sha, keep, delete)) = &self.dup_pending {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 40, 40),
+                    format!(
+                        "Confirm: trash/delete {} other copy(ies) of {sha:.12}…? Kept logical_file_id={keep}. Other versions are not auto-removed from the vault.",
+                        delete.len()
+                    ),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Delete the other copies").clicked() {
+                        confirm_go = true;
+                    }
+                });
+            }
+        });
+
+        if scan_clicked {
+            self.run_duplicate_scan();
+        }
+        if let Some(i) = select_group {
+            self.dup_selected = Some(i);
+            self.dup_pending = None;
+        }
+        if let Some(p) = keep_choice {
+            self.dup_pending = Some(p);
+        }
+        if cancel {
+            self.dup_pending = None;
+        }
+        if confirm_go {
+            if let Some((sha, keep, delete)) = self.dup_pending.take() {
+                self.apply_resolve(sha, keep, delete);
+            }
+        }
+    }
+
+    fn apply_resolve(&mut self, sha: String, keep: LogicalFileId, delete: Vec<LogicalFileId>) {
+        let Some(client) = self.client.clone() else {
+            self.status = "Not connected.".into();
+            return;
+        };
+        let permanent = self.dup_permanent;
+        let result = self.rt.block_on(async {
+            let mut c = client.lock().await;
+            c.resolve_duplicate_group(&sha, Some(keep), delete, true, permanent, false)
+                .await
+        });
+        match result {
+            Ok(report) => {
+                self.status = format!(
+                    "Kept {keep}; {} copy(ies) removed (trash={} permanent={}). {}",
+                    report.deleted.len(),
+                    report.used_trash,
+                    report.permanent,
+                    report.messages.join("; ")
+                );
+                self.run_duplicate_scan();
+            }
+            Err(err) => self.status = format!("Resolve failed: {err}"),
+        }
+    }
+}
+
+fn format_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KiB", n as f64 / 1024.0)
+    } else if n < 1024 * 1024 * 1024 {
+        format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GiB", n as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 

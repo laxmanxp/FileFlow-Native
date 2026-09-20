@@ -2,7 +2,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fileflow_core::{
-    parse_search, LogicalFileId, LogicalFileView, RevisionInfo, SearchHit, TodoItem,
+    parse_search, path_has_excluded_segment, DuplicateGroup, DuplicateMember, DuplicateQuery,
+    DuplicateScan, LogicalFileId, LogicalFileView, RevisionInfo, SearchHit, TodoItem,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -402,6 +403,118 @@ impl Catalog {
         Ok(hits)
     }
 
+    /// Group current (or optionally tombstoned) paths by current-revision SHA-256.
+    pub fn find_duplicates(&self, query: &DuplicateQuery) -> Result<DuplicateScan> {
+        let sql = if query.include_missing {
+            "SELECT fp.logical_file_id, fp.path, r.sha256, c.size
+             FROM file_paths fp
+             JOIN logical_files lf ON lf.id = fp.logical_file_id
+             JOIN revisions r ON r.id = COALESCE(
+                lf.current_revision_id,
+                (SELECT rr.id FROM revisions rr WHERE rr.logical_file_id = lf.id ORDER BY rr.id DESC LIMIT 1)
+             )
+             JOIN content_objects c ON c.sha256 = r.sha256
+             WHERE c.size >= ?1"
+        } else {
+            "SELECT fp.logical_file_id, fp.path, r.sha256, c.size
+             FROM file_paths fp
+             JOIN logical_files lf ON lf.id = fp.logical_file_id
+             JOIN revisions r ON r.id = COALESCE(
+                lf.current_revision_id,
+                (SELECT rr.id FROM revisions rr WHERE rr.logical_file_id = lf.id ORDER BY rr.id DESC LIMIT 1)
+             )
+             JOIN content_objects c ON c.sha256 = r.sha256
+             WHERE fp.is_current = 1 AND c.size >= ?1"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![query.min_size as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })?;
+
+        let prefix = query.path_prefix.as_deref().map(normalize_prefix);
+        let mut by_hash: std::collections::BTreeMap<String, (u64, Vec<DuplicateMember>)> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (id, path, sha, size) = row?;
+            if let Some(p) = &prefix {
+                if !path_under_prefix(&path, p) {
+                    continue;
+                }
+            }
+            if path_has_excluded_segment(&path, &query.exclude_patterns) {
+                continue;
+            }
+            let entry = by_hash.entry(sha).or_insert_with(|| (size, Vec::new()));
+            entry.0 = size;
+            entry.1.push(DuplicateMember {
+                logical_file_id: id,
+                path,
+            });
+        }
+
+        let min_n = query.min_group_size.max(2) as usize;
+        let mut groups: Vec<DuplicateGroup> = by_hash
+            .into_iter()
+            .filter(|(_, (_, members))| members.len() >= min_n)
+            .map(|(sha256, (size, mut members))| {
+                members.sort_by(|a, b| a.path.cmp(&b.path));
+                let n = members.len() as u64;
+                DuplicateGroup {
+                    sha256,
+                    size,
+                    members,
+                    reclaimable_bytes: size.saturating_mul(n.saturating_sub(1)),
+                }
+            })
+            .collect();
+        groups.sort_by(|a, b| {
+            b.reclaimable_bytes
+                .cmp(&a.reclaimable_bytes)
+                .then_with(|| b.size.cmp(&a.size))
+                .then_with(|| a.sha256.cmp(&b.sha256))
+        });
+        let group_count = groups.len() as u64;
+        let member_count = groups.iter().map(|g| g.members.len() as u64).sum();
+        let reclaimable_bytes = groups.iter().map(|g| g.reclaimable_bytes).sum();
+        Ok(DuplicateScan {
+            groups,
+            group_count,
+            member_count,
+            reclaimable_bytes,
+            exclude_patterns_applied: query.exclude_patterns.clone(),
+        })
+    }
+
+    pub fn current_members_for_hash(&self, sha256: &str) -> Result<Vec<DuplicateMember>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fp.logical_file_id, fp.path
+             FROM file_paths fp
+             JOIN logical_files lf ON lf.id = fp.logical_file_id
+             JOIN revisions r ON r.id = COALESCE(
+                lf.current_revision_id,
+                (SELECT rr.id FROM revisions rr WHERE rr.logical_file_id = lf.id ORDER BY rr.id DESC LIMIT 1)
+             )
+             WHERE fp.is_current = 1 AND r.sha256 = ?1
+             ORDER BY fp.path",
+        )?;
+        let rows = stmt.query_map(params![sha256], |row| {
+            Ok(DuplicateMember {
+                logical_file_id: row.get(0)?,
+                path: row.get(1)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn load_view(&self, id: LogicalFileId) -> Result<LogicalFileView> {
         let mut paths = Vec::new();
         {
@@ -684,6 +797,19 @@ fn path_candidates(path: &str) -> Vec<String> {
     out
 }
 
+fn normalize_prefix(prefix: &str) -> String {
+    let mut s = normalize_path(prefix).replace('\\', "/");
+    while s.ends_with('/') && s.len() > 1 {
+        s.pop();
+    }
+    s
+}
+
+fn path_under_prefix(path: &str, prefix: &str) -> bool {
+    let path = path.replace('\\', "/");
+    path == *prefix || path.starts_with(&format!("{prefix}/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,5 +970,60 @@ mod tests {
         assert!(hashes.contains(&"h3"));
         assert!(hashes.contains(&"h4"));
         assert!(!hashes.contains(&"h2"));
+    }
+
+    #[test]
+    fn find_duplicates_groups_by_hash_and_excludes_node_modules() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("docs/a.txt");
+        let b = dir.path().join("docs/b.txt");
+        let c = dir.path().join("node_modules/pkg/a.txt");
+        let uniq = dir.path().join("docs/unique.txt");
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(c.parent().unwrap()).unwrap();
+        std::fs::write(&a, b"same").unwrap();
+        std::fs::write(&b, b"same").unwrap();
+        std::fs::write(&c, b"same").unwrap();
+        std::fs::write(&uniq, b"other").unwrap();
+        cat.upsert_indexed(a.to_str().unwrap(), "hash-same", 4)
+            .unwrap();
+        cat.upsert_indexed(b.to_str().unwrap(), "hash-same", 4)
+            .unwrap();
+        cat.upsert_indexed(c.to_str().unwrap(), "hash-same", 4)
+            .unwrap();
+        cat.upsert_indexed(uniq.to_str().unwrap(), "hash-uniq", 5)
+            .unwrap();
+
+        let open = cat
+            .find_duplicates(&DuplicateQuery::resolved(
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(open.group_count, 1);
+        assert_eq!(open.groups[0].members.len(), 3);
+
+        let filtered = cat
+            .find_duplicates(&DuplicateQuery::resolved(
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(filtered.group_count, 1);
+        assert_eq!(filtered.groups[0].members.len(), 2);
+        assert!(filtered.groups[0]
+            .members
+            .iter()
+            .all(|m| !m.path.contains("node_modules")));
+        assert_eq!(filtered.reclaimable_bytes, 4);
     }
 }

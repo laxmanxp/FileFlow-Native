@@ -1,5 +1,5 @@
 use fileflow_catalog::{Catalog, CatalogError};
-use fileflow_core::{LogicalFileId, LogicalFileView, SearchHit};
+use fileflow_core::{DuplicateQuery, DuplicateScan, LogicalFileId, LogicalFileView, SearchHit};
 use tokio::sync::{mpsc, oneshot};
 
 const QUEUE_BOUND: usize = 64;
@@ -111,6 +111,14 @@ pub enum Command {
         keep_last: u32,
         reply: Reply<Vec<String>>,
     },
+    FindDuplicates {
+        query: DuplicateQuery,
+        reply: Reply<DuplicateScan>,
+    },
+    MembersForHash {
+        sha256: String,
+        reply: Reply<Vec<fileflow_core::DuplicateMember>>,
+    },
 }
 
 pub fn spawn_writer(mut catalog: Catalog) -> mpsc::Sender<Command> {
@@ -215,6 +223,12 @@ pub fn spawn_writer(mut catalog: Catalog) -> mpsc::Sender<Command> {
                     reply,
                 } => {
                     let _ = reply.send(catalog.prune_revisions(id, keep_last));
+                }
+                Command::FindDuplicates { query, reply } => {
+                    let _ = reply.send(catalog.find_duplicates(&query));
+                }
+                Command::MembersForHash { sha256, reply } => {
+                    let _ = reply.send(catalog.current_members_for_hash(&sha256));
                 }
             }
         }

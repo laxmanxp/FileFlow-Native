@@ -1,6 +1,8 @@
 //! Thin client stub: IPC only. Never opens the catalog.
 
-use fileflow_core::{Config, LogicalFileId, LogicalFileView, SearchHit};
+use fileflow_core::{
+    Config, DuplicateActionReport, DuplicateScan, LogicalFileId, LogicalFileView, SearchHit,
+};
 use fileflow_rpc::{connect, IndexReport, Request, Response, RpcConnection, TransportError};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -317,6 +319,83 @@ impl<S: AsyncRead + AsyncWrite + Unpin> FileFlowClient<S> {
             .await?
         {
             Response::Integrity { report } => Ok(report),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn find_duplicates(
+        &mut self,
+        min_group_size: Option<u32>,
+        path_prefix: Option<&str>,
+        exclude_patterns: Option<Vec<String>>,
+        exclude_common_build_vcs_dirs: Option<bool>,
+        min_size: Option<u64>,
+        include_missing: Option<bool>,
+    ) -> Result<DuplicateScan, ClientError> {
+        match self
+            .conn
+            .call(&Request::FindDuplicates {
+                min_group_size,
+                path_prefix: path_prefix.map(|s| s.to_string()),
+                exclude_patterns,
+                exclude_common_build_vcs_dirs,
+                min_size,
+                include_missing,
+            })
+            .await?
+        {
+            Response::DuplicateScan { scan } => Ok(scan),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn resolve_duplicate_group(
+        &mut self,
+        sha256: &str,
+        keep_logical_file_id: Option<LogicalFileId>,
+        delete_logical_file_ids: Vec<LogicalFileId>,
+        confirm: bool,
+        confirm_permanent: bool,
+        allow_delete_all: bool,
+    ) -> Result<DuplicateActionReport, ClientError> {
+        match self
+            .conn
+            .call(&Request::ResolveDuplicateGroup {
+                sha256: sha256.to_string(),
+                keep_logical_file_id,
+                delete_logical_file_ids,
+                confirm,
+                confirm_permanent,
+                allow_delete_all,
+            })
+            .await?
+        {
+            Response::DuplicateAction { report } => Ok(report),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn delete_duplicate_member(
+        &mut self,
+        logical_file_id: LogicalFileId,
+        confirm: bool,
+        confirm_permanent: bool,
+        allow_delete_last: bool,
+    ) -> Result<DuplicateActionReport, ClientError> {
+        match self
+            .conn
+            .call(&Request::DeleteDuplicateMember {
+                logical_file_id,
+                confirm,
+                confirm_permanent,
+                allow_delete_last,
+            })
+            .await?
+        {
+            Response::DuplicateAction { report } => Ok(report),
             Response::Error { message } => Err(ClientError::Service(message)),
             _ => Err(ClientError::Unexpected),
         }

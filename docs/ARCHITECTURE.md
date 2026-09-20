@@ -79,6 +79,20 @@ $FILEFLOW_DATA_HOME/
 
 Revisions belong to `logical_file_id`. Tombstoned paths keep revision history. Restore can fail if the destination is locked by Excel/Photoshop/etc.
 
+## Duplicate manager
+
+Exact duplicates are **the same SHA-256** (current revision) among catalog rows. Tombstoned paths are omitted unless `include_missing` is set (default off). Groups are sorted by reclaimable bytes (`size × (n-1)`).
+
+Exclusion patterns are **path segments** (directory names), not filename substrings: `…/node_modules/pkg/x` is skipped; `…/src/index.js` is not; `my_target` is not `target`. Defaults (on when `exclude_common_build_vcs_dirs` is true, the scan default): `.git`, `node_modules`, `vendor`, `target`, `build`, `dist`, `.cache`. Source code is **not** globally excluded.
+
+| RPC | Behavior |
+| --- | --- |
+| `FindDuplicates` | Query catalog hashes. Filters: `min_group_size` (default 2), `path_prefix`, `exclude_patterns`, `exclude_common_build_vcs_dirs` (default true), `min_size`, `include_missing`. |
+| `ResolveDuplicateGroup` | Keep one `logical_file_id`; trash/delete listed others. Requires `confirm=true`. Refuses deleting every member unless `allow_delete_all`. Keep target must be in the group. |
+| `DeleteDuplicateMember` | One-off removal; refuses the last current copy unless `allow_delete_last`. |
+
+The service performs filesystem removal, then tombstones the path. Prefer trash/recycle; if that fails, `confirm_permanent=true` unlinks permanently. The kept file (and its vault history) is not modified. There is no scheduled or “clean all” path.
+
 ## IPC
 
 Client/server **stub** pattern:
@@ -98,4 +112,4 @@ fileflow-client  (same stub)
 
 ## Out of scope (v1)
 
-Encrypted vault, cloud backup/`.ffbackup`, Explorer shell extension/NSIS, Office/CAD preview workers, duplicate-manager UX, email transport.
+Encrypted vault, cloud backup/`.ffbackup`, Explorer shell extension/NSIS, Office/CAD preview workers, fuzzy/near-duplicate detection, automatic cleanup schedules, email transport.

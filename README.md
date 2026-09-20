@@ -45,11 +45,14 @@ cargo run -p fileflow-shell
 1. **Add** — paste or Browse a folder, then Index (registers an indexed location and starts watching).  
 2. **Find** — search with free text plus `tag:`, `todo:`, `notes:`, `ext:`.  
 3. **Open** / **Reveal** the selected file.  
-4. **Edit** tags, notes, todos. Optionally **Vault** the file to keep immutable content revisions; **Make current** restores a prior version to the current path.
+4. **Edit** tags, notes, todos. Optionally **Vault** the file to keep immutable content revisions; **Make current** restores a prior version to the current path.  
+5. **Duplicates** — scan catalog hashes, review groups (“N identical files”), **Keep this**, then confirm deleting the other copies (no “Clean all”).
 
 Creates, renames/moves, edits, and deletes under indexed folders update the catalog automatically. Delete **tombstones** the path (`is_current = 0`) but keeps the logical file and its tags/notes/todos. Pause/Resume watch from the shell or RPC.
 
 Vaulted files also store content under `$FILEFLOW_DATA_HOME/vault/objects/{aa}/{bb}/{sha256}`. Ordinary indexed files stay metadata-only. Removing vault membership does **not** delete historical blobs (use prune / keep-last-N). Default retention is **keep forever**. Restore uses temp+rename; it can fail if another app has the file locked.
+
+**Duplicates** are exact SHA-256 matches among **current** catalog paths. Default scan excludes path segments `.git`, `node_modules`, `vendor`, `target`, `build`, `dist`, `.cache` (directory-name match, not a global “skip source code” rule). Source trees are not excluded; cleanup is report-first and requires a per-group confirmation. The service tries OS trash (Linux XDG Trash, macOS `~/.Trash`, Windows Recycle Bin). If trash fails, RPC needs `confirm_permanent=true` and the unlink is **permanent**. The last remaining copy in a hash group is not deleted unless `allow_delete_all` / `allow_delete_last` is set.
 
 ## Run (Windows)
 
@@ -79,6 +82,7 @@ Defaults: `%LOCALAPPDATA%\FileFlow` and `\\.\pipe\FileFlow` on Windows; `~/.loca
 - Service: Health, ResolvePath, IndexFolder, tag/note/todo, and path rewrite over Linux UDS.  
 - Watcher: temp tree create/rename/modify/delete over Linux UDS (`notify` + debounce).  
 - Vault: AddToVault stores blob; modify appends revision; SetCurrentRevision restores bytes; verify detects tampering.  
+- Duplicates: FindDuplicates groups; exclusions hide `node_modules`; ResolveDuplicateGroup keeps one copy; refuse delete-all.  
 - Shell: manifest must not depend on `rusqlite` or `fileflow-catalog`.
 
 ## Architecture

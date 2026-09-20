@@ -1,4 +1,7 @@
-use fileflow_core::{IntegrityReport, LogicalFileId, LogicalFileView, RevisionInfo, SearchHit};
+use fileflow_core::{
+    DuplicateActionReport, DuplicateScan, IntegrityReport, LogicalFileId, LogicalFileView,
+    RevisionInfo, SearchHit,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +86,28 @@ pub enum Request {
     VerifyContentObject {
         sha256: String,
     },
+    FindDuplicates {
+        min_group_size: Option<u32>,
+        path_prefix: Option<String>,
+        exclude_patterns: Option<Vec<String>>,
+        exclude_common_build_vcs_dirs: Option<bool>,
+        min_size: Option<u64>,
+        include_missing: Option<bool>,
+    },
+    ResolveDuplicateGroup {
+        sha256: String,
+        keep_logical_file_id: Option<LogicalFileId>,
+        delete_logical_file_ids: Vec<LogicalFileId>,
+        confirm: bool,
+        confirm_permanent: bool,
+        allow_delete_all: bool,
+    },
+    DeleteDuplicateMember {
+        logical_file_id: LogicalFileId,
+        confirm: bool,
+        confirm_permanent: bool,
+        allow_delete_last: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +152,12 @@ pub enum Response {
     },
     Integrity {
         report: IntegrityReport,
+    },
+    DuplicateScan {
+        scan: DuplicateScan,
+    },
+    DuplicateAction {
+        report: DuplicateActionReport,
     },
     Ok,
     Error {

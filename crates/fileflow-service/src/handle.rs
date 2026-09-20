@@ -1,6 +1,9 @@
 use crate::vault::VaultStore;
 use fileflow_catalog::{Catalog, CatalogError};
-use fileflow_core::{IntegrityReport, LogicalFileId, LogicalFileView, RevisionInfo, SearchHit};
+use fileflow_core::{
+    DuplicateActionReport, DuplicateMember, IntegrityReport, LogicalFileId, LogicalFileView,
+    RevisionInfo, SearchHit,
+};
 use fileflow_rpc::{Request, Response, WatcherStatus};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -242,6 +245,63 @@ impl FileFlowService {
             Request::VerifyContentObject { sha256 } => Ok(Response::Integrity {
                 report: self.vault.verify(&sha256),
             }),
+            Request::FindDuplicates {
+                min_group_size,
+                path_prefix,
+                exclude_patterns,
+                exclude_common_build_vcs_dirs,
+                min_size,
+                include_missing,
+            } => {
+                let query = fileflow_core::DuplicateQuery::resolved(
+                    min_group_size,
+                    path_prefix,
+                    exclude_patterns,
+                    exclude_common_build_vcs_dirs,
+                    min_size,
+                    include_missing,
+                );
+                let scan = self
+                    .call(|reply| Command::FindDuplicates { query, reply })
+                    .await?;
+                Ok(Response::DuplicateScan { scan })
+            }
+            Request::ResolveDuplicateGroup {
+                sha256,
+                keep_logical_file_id,
+                delete_logical_file_ids,
+                confirm,
+                confirm_permanent,
+                allow_delete_all,
+            } => {
+                let report = self
+                    .resolve_duplicate_group(
+                        sha256,
+                        keep_logical_file_id,
+                        delete_logical_file_ids,
+                        confirm,
+                        confirm_permanent,
+                        allow_delete_all,
+                    )
+                    .await?;
+                Ok(Response::DuplicateAction { report })
+            }
+            Request::DeleteDuplicateMember {
+                logical_file_id,
+                confirm,
+                confirm_permanent,
+                allow_delete_last,
+            } => {
+                let report = self
+                    .delete_duplicate_member(
+                        logical_file_id,
+                        confirm,
+                        confirm_permanent,
+                        allow_delete_last,
+                    )
+                    .await?;
+                Ok(Response::DuplicateAction { report })
+            }
         }
     }
 
@@ -483,6 +543,157 @@ impl FileFlowService {
             })
             .await?;
         Ok(self.vault.verify(&info.sha256))
+    }
+
+    async fn resolve_duplicate_group(
+        &self,
+        sha256: String,
+        keep_logical_file_id: Option<LogicalFileId>,
+        delete_logical_file_ids: Vec<LogicalFileId>,
+        confirm: bool,
+        confirm_permanent: bool,
+        allow_delete_all: bool,
+    ) -> Result<DuplicateActionReport, CatalogError> {
+        if !confirm {
+            return Err(CatalogError::msg(
+                "ResolveDuplicateGroup requires confirm=true (review-first; no mass delete)",
+            ));
+        }
+        let members = self
+            .call(|reply| Command::MembersForHash {
+                sha256: sha256.clone(),
+                reply,
+            })
+            .await?;
+        if members.is_empty() {
+            return Err(CatalogError::NotFound(format!(
+                "no current paths for hash {sha256}"
+            )));
+        }
+        if let Some(keep) = keep_logical_file_id {
+            if !members.iter().any(|m| m.logical_file_id == keep) {
+                return Err(CatalogError::msg(
+                    "keep target is not a current member of this duplicate group",
+                ));
+            }
+        }
+        let mut delete_ids: Vec<LogicalFileId> = if delete_logical_file_ids.is_empty() {
+            members
+                .iter()
+                .map(|m| m.logical_file_id)
+                .filter(|id| Some(*id) != keep_logical_file_id)
+                .collect()
+        } else {
+            delete_logical_file_ids
+        };
+        if let Some(keep) = keep_logical_file_id {
+            delete_ids.retain(|id| *id != keep);
+        }
+        delete_ids.sort_unstable();
+        delete_ids.dedup();
+
+        let remaining: Vec<_> = members
+            .iter()
+            .filter(|m| !delete_ids.contains(&m.logical_file_id))
+            .collect();
+        if remaining.is_empty() && !allow_delete_all {
+            return Err(CatalogError::msg(
+                "refusing to delete every copy in the group; keep one member or set allow_delete_all",
+            ));
+        }
+        if keep_logical_file_id.is_none() && !allow_delete_all {
+            return Err(CatalogError::msg(
+                "keep_logical_file_id is required unless allow_delete_all is set",
+            ));
+        }
+
+        self.delete_members(&members, &delete_ids, confirm_permanent)
+            .await
+            .map(|mut report| {
+                report.kept_logical_file_id = keep_logical_file_id;
+                report
+            })
+    }
+
+    async fn delete_duplicate_member(
+        &self,
+        logical_file_id: LogicalFileId,
+        confirm: bool,
+        confirm_permanent: bool,
+        allow_delete_last: bool,
+    ) -> Result<DuplicateActionReport, CatalogError> {
+        if !confirm {
+            return Err(CatalogError::msg(
+                "DeleteDuplicateMember requires confirm=true",
+            ));
+        }
+        let view = self
+            .get_file(logical_file_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(format!("logical_file {logical_file_id}")))?;
+        let sha = view
+            .sha256
+            .ok_or_else(|| CatalogError::msg("file has no content hash"))?;
+        let members = self
+            .call(|reply| Command::MembersForHash {
+                sha256: sha.clone(),
+                reply,
+            })
+            .await?;
+        if !members.iter().any(|m| m.logical_file_id == logical_file_id) {
+            return Err(CatalogError::msg("no current path for that logical file"));
+        }
+        if members.len() <= 1 && !allow_delete_last {
+            return Err(CatalogError::msg(
+                "refusing to delete the last remaining copy; set allow_delete_last to override",
+            ));
+        }
+        self.delete_members(&members, &[logical_file_id], confirm_permanent)
+            .await
+    }
+
+    async fn delete_members(
+        &self,
+        members: &[DuplicateMember],
+        delete_ids: &[LogicalFileId],
+        confirm_permanent: bool,
+    ) -> Result<DuplicateActionReport, CatalogError> {
+        let mut deleted = Vec::new();
+        let mut used_trash = false;
+        let mut permanent = false;
+        let mut messages = Vec::new();
+        for member in members {
+            if !delete_ids.contains(&member.logical_file_id) {
+                continue;
+            }
+            let path = std::path::PathBuf::from(&member.path);
+            let kind = tokio::task::spawn_blocking(move || {
+                crate::trash::remove_path(&path, confirm_permanent)
+            })
+            .await
+            .map_err(|e| CatalogError::msg(e.to_string()))??;
+            match kind {
+                crate::trash::RemovalKind::Trashed => used_trash = true,
+                crate::trash::RemovalKind::Permanent => permanent = true,
+            }
+            self.tombstone_path(&member.path).await?;
+            deleted.push(member.clone());
+            messages.push(format!(
+                "{} {}",
+                match kind {
+                    crate::trash::RemovalKind::Trashed => "trashed",
+                    crate::trash::RemovalKind::Permanent => "deleted",
+                },
+                member.path
+            ));
+        }
+        Ok(DuplicateActionReport {
+            kept_logical_file_id: None,
+            deleted,
+            used_trash,
+            permanent,
+            messages,
+        })
     }
 
     async fn call<T>(

@@ -4,6 +4,7 @@ mod actor;
 mod handle;
 mod indexer;
 mod server;
+mod trash;
 mod vault;
 mod watcher;
 
