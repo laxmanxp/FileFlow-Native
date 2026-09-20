@@ -5,19 +5,34 @@ use tokio::sync::{mpsc, oneshot};
 use crate::actor::{spawn_writer, Command};
 use crate::health_status;
 use crate::indexer::{index_folder, index_path};
-use fileflow_rpc::{IndexReport, Request, Response};
+use crate::watcher::WatcherHandle;
+use fileflow_rpc::{Request, Response, WatcherStatus};
 
 /// Service handle. Catalog writes serialize through the writer actor.
 #[derive(Clone)]
 pub struct FileFlowService {
     tx: mpsc::Sender<Command>,
+    watcher: WatcherHandle,
 }
 
 impl FileFlowService {
     pub fn spawn(catalog: Catalog) -> Self {
-        Self {
-            tx: spawn_writer(catalog),
-        }
+        let tx = spawn_writer(catalog);
+        let (watcher, cmd_rx, snap) = WatcherHandle::pair();
+        let svc = Self { tx, watcher };
+        WatcherHandle::start(svc.clone(), cmd_rx, snap);
+        let boot = svc.clone();
+        tokio::spawn(async move {
+            match boot.list_indexed_locations().await {
+                Ok(roots) => {
+                    for root in roots {
+                        boot.watcher.add_root(root).await;
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err, "failed to restore indexed locations"),
+            }
+        });
+        svc
     }
 
     pub async fn handle_rpc(&self, req: Request) -> Response {
@@ -47,6 +62,8 @@ impl FileFlowService {
                 Ok(Response::Indexed { report })
             }
             Request::IndexFolder { path } => {
+                let stored = self.add_indexed_location(&path).await?;
+                self.watcher.add_root(stored).await;
                 let report = index_folder(self, &path).await?;
                 Ok(Response::Indexed { report })
             }
@@ -120,12 +137,31 @@ impl FileFlowService {
                 logical_file_id,
                 new_path,
             } => {
-                self.call(|reply| Command::UpdatePath {
-                    id: logical_file_id,
-                    new_path,
+                self.update_path(logical_file_id, &new_path).await?;
+                Ok(Response::Ok)
+            }
+            Request::PauseWatcher => {
+                self.watcher.pause().await;
+                Ok(Response::Ok)
+            }
+            Request::ResumeWatcher => {
+                self.watcher.resume().await;
+                Ok(Response::Ok)
+            }
+            Request::GetWatcherStatus => Ok(Response::WatcherStatus {
+                status: self.watcher.status(),
+            }),
+            Request::ListIndexedLocations => {
+                let roots = self.list_indexed_locations().await?;
+                Ok(Response::IndexedLocations { roots })
+            }
+            Request::RemoveIndexedLocation { path } => {
+                self.call(|reply| Command::RemoveIndexedLocation {
+                    path: path.clone(),
                     reply,
                 })
                 .await?;
+                self.watcher.remove_root(path).await;
                 Ok(Response::Ok)
             }
         }
@@ -134,6 +170,15 @@ impl FileFlowService {
     pub async fn resolve_path(&self, path: &str) -> Result<Option<LogicalFileId>, CatalogError> {
         let path = path.to_string();
         self.call(|reply| Command::ResolvePath { path, reply })
+            .await
+    }
+
+    pub async fn resolve_path_any(
+        &self,
+        path: &str,
+    ) -> Result<Option<LogicalFileId>, CatalogError> {
+        let path = path.to_string();
+        self.call(|reply| Command::LookupAnyPath { path, reply })
             .await
     }
 
@@ -164,6 +209,37 @@ impl FileFlowService {
         self.call(|reply| Command::Search { query, reply }).await
     }
 
+    pub async fn update_path(&self, id: LogicalFileId, new_path: &str) -> Result<(), CatalogError> {
+        let new_path = new_path.to_string();
+        self.call(|reply| Command::UpdatePath {
+            id,
+            new_path,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn tombstone_path(&self, path: &str) -> Result<Option<LogicalFileId>, CatalogError> {
+        let path = path.to_string();
+        self.call(|reply| Command::TombstonePath { path, reply })
+            .await
+    }
+
+    pub async fn add_indexed_location(&self, path: &str) -> Result<String, CatalogError> {
+        let path = path.to_string();
+        self.call(|reply| Command::AddIndexedLocation { path, reply })
+            .await
+    }
+
+    pub async fn list_indexed_locations(&self) -> Result<Vec<String>, CatalogError> {
+        self.call(|reply| Command::ListIndexedLocations { reply })
+            .await
+    }
+
+    pub fn watcher_status(&self) -> WatcherStatus {
+        self.watcher.status()
+    }
+
     async fn call<T>(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<T, CatalogError>>) -> Command,
@@ -175,28 +251,5 @@ impl FileFlowService {
             .map_err(|_| CatalogError::msg("catalog writer stopped"))?;
         rx.await
             .map_err(|_| CatalogError::msg("catalog writer dropped reply"))?
-    }
-}
-
-pub async fn index_one_file(
-    service: &FileFlowService,
-    path: &std::path::Path,
-) -> Result<LogicalFileId, CatalogError> {
-    let path_owned = path.to_path_buf();
-    let (sha256, size) = tokio::task::spawn_blocking(move || fileflow_core::hash_file(&path_owned))
-        .await
-        .map_err(|e| CatalogError::msg(e.to_string()))?
-        .map_err(|e| CatalogError::msg(e.to_string()))?;
-    service
-        .upsert_indexed(path.to_string_lossy().into_owned(), sha256, size)
-        .await
-}
-
-/// Used from indexer after hashing off the writer thread.
-pub fn empty_report() -> IndexReport {
-    IndexReport {
-        indexed: 0,
-        skipped: 0,
-        last_logical_file_id: None,
     }
 }

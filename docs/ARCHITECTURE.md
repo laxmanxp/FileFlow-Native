@@ -37,6 +37,21 @@ Logical File
 
 Reads in v0 also go through the same actor so there is one owner of the `rusqlite::Connection`.
 
+## Indexed locations and watcher
+
+`IndexFolder` persists the folder in `indexed_locations`. FileFlowService watches those roots with the `notify` crate (recursive). Events are coalesced with a ~200ms debounce on a **bounded** queue (overflow drops events and records `last_error`).
+
+| Disk event | Catalog |
+| --- | --- |
+| Create | Stream-hash and `upsert_indexed` (new logical id, or reuse if the path was tombstoned). |
+| Modify | Re-hash outside the DB; new revision if SHA-256 changed. |
+| Rename/move | `UpdatePath` — **same** `logical_file_id` when the watcher can correlate from→to. |
+| Delete | **Tombstone**: `file_paths.is_current = 0`. Logical file + tags/notes/todos/revisions stay. Search hides it. Recreate at the same path reattaches the same id. |
+
+The UI never watches the disk. RPC: `GetWatcherStatus`, `PauseWatcher`, `ResumeWatcher`, `ListIndexedLocations`. Resume re-watches roots and rescans.
+
+Windows: `ReadDirectoryChangesW` is noisy and often emits remove+create instead of a native rename; the service pairs a same-directory delete+create in one debounce window as a rename. Prefer a slightly longer quiet period if a save-to-temp workflow mis-pairs.
+
 ## IPC
 
 Client/server **stub** pattern:
@@ -53,6 +68,6 @@ fileflow-shell  --RPC-->  fileflow-service  --owns-->  catalog.sqlite
 fileflow-client  (same stub)
 ```
 
-## Out of scope (v0)
+## Out of scope (v0+)
 
 Full vault UX, Explorer shell extension/NSIS, cloud backup, Office preview parsers, duplicate-manager UX.

@@ -4,6 +4,7 @@ mod actor;
 mod handle;
 mod indexer;
 mod server;
+mod watcher;
 
 pub use handle::FileFlowService;
 pub use server::serve;

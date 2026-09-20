@@ -43,6 +43,13 @@ pub enum Request {
         logical_file_id: LogicalFileId,
         new_path: String,
     },
+    PauseWatcher,
+    ResumeWatcher,
+    GetWatcherStatus,
+    ListIndexedLocations,
+    RemoveIndexedLocation {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,10 +80,24 @@ pub enum Response {
     TodoCreated {
         todo_id: i64,
     },
+    WatcherStatus {
+        status: WatcherStatus,
+    },
+    IndexedLocations {
+        roots: Vec<String>,
+    },
     Ok,
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatcherStatus {
+    pub paused: bool,
+    pub roots: Vec<String>,
+    pub queue_depth: usize,
+    pub last_error: Option<String>,
 }
 
 impl Response {

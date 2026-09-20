@@ -156,12 +156,23 @@ impl FileFlowApp {
             let conn = fileflow_rpc::connect(&cfg.socket).await?;
             let mut client = FileFlowClient::new(conn);
             let health = client.health().await?;
-            Ok::<_, ClientError>((client, health))
+            let watch = client.watcher_status().await.ok();
+            Ok::<_, ClientError>((client, health, watch))
         }) {
-            Ok((client, (status, version))) => {
+            Ok((client, (status, version), watch)) => {
                 self.client = Some(Arc::new(Mutex::new(client)));
+                let extra = watch
+                    .map(|w| {
+                        format!(
+                            "  watch {} root(s) paused={} q={}",
+                            w.roots.len(),
+                            w.paused,
+                            w.queue_depth
+                        )
+                    })
+                    .unwrap_or_default();
                 self.status = format!(
-                    "Connected ({status} v{version})  socket={}",
+                    "Connected ({status} v{version})  socket={}{extra}",
                     cfg.socket.display()
                 );
             }
@@ -227,9 +238,45 @@ impl FileFlowApp {
             Ok(IndexReport {
                 indexed, skipped, ..
             }) => {
-                self.status = format!("Indexed {indexed} file(s), skipped {skipped}");
+                let extra = self
+                    .client
+                    .clone()
+                    .and_then(|c| {
+                        self.rt
+                            .block_on(async { c.lock().await.watcher_status().await.ok() })
+                    })
+                    .map(|w| format!("; watching {} root(s)", w.roots.len()))
+                    .unwrap_or_default();
+                self.status = format!("Indexed {indexed} file(s), skipped {skipped}{extra}");
             }
             Err(err) => self.status = format!("Error: {err}"),
+        }
+    }
+
+    fn set_watch_paused(&mut self, pause: bool) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let result = self.rt.block_on(async {
+            let mut c = client.lock().await;
+            if pause {
+                c.pause_watcher().await?;
+            } else {
+                c.resume_watcher().await?;
+            }
+            c.watcher_status().await
+        });
+        match result {
+            Ok(st) => {
+                self.status = format!(
+                    "Watcher paused={} roots={} q={} err={:?}",
+                    st.paused,
+                    st.roots.len(),
+                    st.queue_depth,
+                    st.last_error
+                );
+            }
+            Err(err) => self.status = format!("Watcher error: {err}"),
         }
     }
 
@@ -255,6 +302,12 @@ impl FileFlowApp {
                 }
                 if ui.button("Index").clicked() {
                     self.index_folder();
+                }
+                if ui.button("Pause watch").clicked() {
+                    self.set_watch_paused(true);
+                }
+                if ui.button("Resume watch").clicked() {
+                    self.set_watch_paused(false);
                 }
             });
             ui.horizontal(|ui| {

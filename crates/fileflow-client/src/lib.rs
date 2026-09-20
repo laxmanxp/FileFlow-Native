@@ -174,6 +174,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> FileFlowClient<S> {
         .await
     }
 
+    pub async fn pause_watcher(&mut self) -> Result<(), ClientError> {
+        self.expect_ok(Request::PauseWatcher).await
+    }
+
+    pub async fn resume_watcher(&mut self) -> Result<(), ClientError> {
+        self.expect_ok(Request::ResumeWatcher).await
+    }
+
+    pub async fn watcher_status(&mut self) -> Result<fileflow_rpc::WatcherStatus, ClientError> {
+        match self.conn.call(&Request::GetWatcherStatus).await? {
+            Response::WatcherStatus { status } => Ok(status),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn list_indexed_locations(&mut self) -> Result<Vec<String>, ClientError> {
+        match self.conn.call(&Request::ListIndexedLocations).await? {
+            Response::IndexedLocations { roots } => Ok(roots),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
     async fn expect_ok(&mut self, req: Request) -> Result<(), ClientError> {
         match self.conn.call(&req).await? {
             Response::Ok => Ok(()),

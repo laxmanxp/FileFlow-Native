@@ -66,6 +66,14 @@ CREATE TABLE IF NOT EXISTS revisions (
 CREATE INDEX IF NOT EXISTS idx_revisions_logical ON revisions(logical_file_id);
 "#;
 
+const MIGRATION_002: &str = r#"
+CREATE TABLE IF NOT EXISTS indexed_locations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+);
+"#;
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
@@ -77,6 +85,15 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     )?;
     if applied == 0 {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (1)", [])?;
+    }
+    conn.execute_batch(MIGRATION_002)?;
+    let applied2: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM schema_migrations WHERE version = 2",
+        [],
+        |row| row.get(0),
+    )?;
+    if applied2 == 0 {
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (2)", [])?;
     }
     Ok(())
 }

@@ -2,7 +2,7 @@
 
 Local-first file intelligence: searchable metadata, stable identity, deduplication hashes, tasks, and notes on ordinary files — without replacing the filesystem.
 
-FileFlowService is the only process that opens the SQLite catalog. The desktop shell talks to it over IPC (Windows named pipe, Linux Unix domain socket).
+FileFlowService is the only process that opens the SQLite catalog. Indexed folder roots persist in SQLite (`indexed_locations`) so the service can keep watching them across restarts. The desktop shell talks to the service over IPC and does not watch the filesystem itself.
 
 ## Workspace
 
@@ -42,10 +42,12 @@ In another:
 cargo run -p fileflow-shell
 ```
 
-1. **Add** — paste or Browse a folder, then Index.  
+1. **Add** — paste or Browse a folder, then Index (registers an indexed location and starts watching).  
 2. **Find** — search with free text plus `tag:`, `todo:`, `notes:`, `ext:`.  
 3. **Open** / **Reveal** the selected file.  
 4. **Edit** tags, notes, and todos (all keyed by `logical_file_id`).
+
+Creates, renames/moves, edits, and deletes under indexed folders update the catalog automatically. Delete **tombstones** the path (`is_current = 0`) but keeps the logical file and its tags/notes/todos. Pause/Resume watch from the shell or RPC.
 
 ## Run (Windows)
 
@@ -70,9 +72,10 @@ Defaults: `%LOCALAPPDATA%\FileFlow` and `\\.\pipe\FileFlow` on Windows; `~/.loca
 
 ## Tests
 
-- Catalog: logical id survives path update; tags/notes/todos search.  
+- Catalog: logical id survives path update; tags/notes/todos search; tombstone keeps metadata.  
 - Core: streaming SHA-256 for files larger than the hash buffer.  
 - Service: Health, ResolvePath, IndexFolder, tag/note/todo, and path rewrite over Linux UDS.  
+- Watcher: temp tree create/rename/modify/delete over Linux UDS (`notify` + debounce).  
 - Shell: manifest must not depend on `rusqlite` or `fileflow-catalog`.
 
 ## Architecture

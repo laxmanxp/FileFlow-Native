@@ -3,5 +3,5 @@
 mod protocol;
 mod transport;
 
-pub use protocol::{IndexReport, Request, Response};
+pub use protocol::{IndexReport, Request, Response, WatcherStatus};
 pub use transport::{connect, listen, Listener, RpcConnection, TransportError};

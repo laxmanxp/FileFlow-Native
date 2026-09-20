@@ -4,7 +4,29 @@ use fileflow_catalog::CatalogError;
 use fileflow_rpc::IndexReport;
 use walkdir::WalkDir;
 
-use crate::handle::{empty_report, index_one_file, FileFlowService};
+use crate::handle::FileFlowService;
+
+pub fn empty_report() -> IndexReport {
+    IndexReport {
+        indexed: 0,
+        skipped: 0,
+        last_logical_file_id: None,
+    }
+}
+
+pub async fn index_one_file(
+    service: &FileFlowService,
+    path: &Path,
+) -> Result<fileflow_core::LogicalFileId, CatalogError> {
+    let path_owned = path.to_path_buf();
+    let (sha256, size) = tokio::task::spawn_blocking(move || fileflow_core::hash_file(&path_owned))
+        .await
+        .map_err(|e| CatalogError::msg(e.to_string()))?
+        .map_err(|e| CatalogError::msg(e.to_string()))?;
+    service
+        .upsert_indexed(path.to_string_lossy().into_owned(), sha256, size)
+        .await
+}
 
 pub async fn index_path(
     service: &FileFlowService,
@@ -53,7 +75,7 @@ pub async fn index_folder(
     Ok(report)
 }
 
-fn collect_files(root: &Path) -> Vec<PathBuf> {
+pub fn collect_files(root: &Path) -> Vec<PathBuf> {
     WalkDir::new(root)
         .follow_links(false)
         .into_iter()

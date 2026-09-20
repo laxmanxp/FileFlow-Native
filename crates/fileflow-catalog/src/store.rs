@@ -29,15 +29,30 @@ impl Catalog {
     }
 
     pub fn resolve_path(&self, path: &str) -> Result<Option<LogicalFileId>> {
-        let path = normalize_path(path);
-        self.conn
-            .query_row(
-                "SELECT logical_file_id FROM file_paths WHERE path = ?1 AND is_current = 1",
-                params![path],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
+        self.lookup_path(path, true)
+    }
+
+    /// Resolve even if the path is tombstoned (`is_current = 0`).
+    pub fn resolve_path_any(&self, path: &str) -> Result<Option<LogicalFileId>> {
+        self.lookup_path(path, false)
+    }
+
+    fn lookup_path(&self, path: &str, current_only: bool) -> Result<Option<LogicalFileId>> {
+        let sql = if current_only {
+            "SELECT logical_file_id FROM file_paths WHERE path = ?1 AND is_current = 1"
+        } else {
+            "SELECT logical_file_id FROM file_paths WHERE path = ?1"
+        };
+        for candidate in path_candidates(path) {
+            let found = self
+                .conn
+                .query_row(sql, params![candidate], |row| row.get(0))
+                .optional()?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
     }
 
     /// Record an indexed file. Hashing must already have happened outside this txn.
@@ -130,6 +145,70 @@ impl Catalog {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Keep the logical file (tags/notes/todos/revisions). Clear live path(s).
+    /// Recreating the same pathname later reuses the id via `upsert_indexed`.
+    pub fn tombstone_path(&mut self, path: &str) -> Result<Option<LogicalFileId>> {
+        let mut last = None;
+        let tx = self.conn.transaction()?;
+        let current: Vec<(LogicalFileId, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT logical_file_id, path FROM file_paths WHERE is_current = 1")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            collected
+        };
+        let candidates = path_candidates(path);
+        for (id, stored) in current {
+            let hit = candidates.iter().any(|c| {
+                stored == *c
+                    || stored.starts_with(&format!("{c}/"))
+                    || stored.starts_with(&format!("{c}\\"))
+            });
+            if hit {
+                tx.execute(
+                    "UPDATE file_paths SET is_current = 0 WHERE path = ?1",
+                    params![stored],
+                )?;
+                last = Some(id);
+            }
+        }
+        tx.commit()?;
+        Ok(last)
+    }
+
+    pub fn add_indexed_location(&mut self, path: &str) -> Result<String> {
+        let stored = normalize_dir(path);
+        let now = now_secs();
+        self.conn.execute(
+            "INSERT INTO indexed_locations (path, created_at) VALUES (?1, ?2)
+             ON CONFLICT(path) DO NOTHING",
+            params![stored, now],
+        )?;
+        Ok(stored)
+    }
+
+    pub fn remove_indexed_location(&mut self, path: &str) -> Result<()> {
+        for candidate in path_candidates(path) {
+            self.conn.execute(
+                "DELETE FROM indexed_locations WHERE path = ?1",
+                params![candidate],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_indexed_locations(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM indexed_locations ORDER BY path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn add_tag(&mut self, id: LogicalFileId, tag: &str) -> Result<()> {
@@ -390,6 +469,24 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
+fn normalize_dir(path: &str) -> String {
+    normalize_path(path)
+}
+
+fn path_candidates(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let slash = path.replace('\\', "/");
+    if let Ok(c) = std::fs::canonicalize(path) {
+        out.push(c.to_string_lossy().into_owned());
+    }
+    out.push(slash);
+    if !out.iter().any(|p| p == path) {
+        out.push(path.to_string());
+    }
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +559,44 @@ mod tests {
         assert_eq!(id1, id2);
         let view = cat.get_file(id1).unwrap().unwrap();
         assert_eq!(view.sha256.as_deref(), Some("hash2"));
+    }
+
+    #[test]
+    fn tombstone_keeps_logical_file_and_metadata() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep-me.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let p = path.to_str().unwrap();
+        let id = cat.upsert_indexed(p, "h1", 1).unwrap();
+        cat.add_tag(id, "saved").unwrap();
+        cat.set_note(id, "still here").unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        let tomb = cat.tombstone_path(p).unwrap();
+        assert_eq!(tomb, Some(id));
+        assert_eq!(cat.resolve_path(p).unwrap(), None);
+        let view = cat.get_file(id).unwrap().unwrap();
+        assert!(view.paths.is_empty());
+        assert_eq!(view.tags, vec!["saved"]);
+        assert_eq!(view.note, "still here");
+
+        std::fs::write(&path, b"x").unwrap();
+        let id2 = cat.upsert_indexed(p, "h1", 1).unwrap();
+        assert_eq!(id, id2);
+        assert_eq!(cat.resolve_path(p).unwrap(), Some(id));
+    }
+
+    #[test]
+    fn indexed_locations_persist() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let dir = tempdir().unwrap();
+        let stored = cat
+            .add_indexed_location(dir.path().to_str().unwrap())
+            .unwrap();
+        let listed = cat.list_indexed_locations().unwrap();
+        assert_eq!(listed, vec![stored.clone()]);
+        cat.remove_indexed_location(&stored).unwrap();
+        assert!(cat.list_indexed_locations().unwrap().is_empty());
     }
 }

@@ -15,6 +15,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 walkdir.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
 fileflow-client.workspace = true

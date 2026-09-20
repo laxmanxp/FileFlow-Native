@@ -55,6 +55,25 @@ pub enum Command {
         done: bool,
         reply: Reply<()>,
     },
+    AddIndexedLocation {
+        path: String,
+        reply: Reply<String>,
+    },
+    ListIndexedLocations {
+        reply: Reply<Vec<String>>,
+    },
+    RemoveIndexedLocation {
+        path: String,
+        reply: Reply<()>,
+    },
+    TombstonePath {
+        path: String,
+        reply: Reply<Option<LogicalFileId>>,
+    },
+    LookupAnyPath {
+        path: String,
+        reply: Reply<Option<LogicalFileId>>,
+    },
 }
 
 pub fn spawn_writer(mut catalog: Catalog) -> mpsc::Sender<Command> {
@@ -104,6 +123,21 @@ pub fn spawn_writer(mut catalog: Catalog) -> mpsc::Sender<Command> {
                     reply,
                 } => {
                     let _ = reply.send(catalog.set_todo_done(todo_id, done));
+                }
+                Command::AddIndexedLocation { path, reply } => {
+                    let _ = reply.send(catalog.add_indexed_location(&path));
+                }
+                Command::ListIndexedLocations { reply } => {
+                    let _ = reply.send(catalog.list_indexed_locations());
+                }
+                Command::RemoveIndexedLocation { path, reply } => {
+                    let _ = reply.send(catalog.remove_indexed_location(&path));
+                }
+                Command::TombstonePath { path, reply } => {
+                    let _ = reply.send(catalog.tombstone_path(&path));
+                }
+                Command::LookupAnyPath { path, reply } => {
+                    let _ = reply.send(catalog.resolve_path_any(&path));
                 }
             }
         }
