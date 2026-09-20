@@ -1,0 +1,13 @@
+[package]
+name = "fileflow-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Thin FileFlow client stub (IPC only; no catalog/SQLite)"
+
+[dependencies]
+fileflow-core.workspace = true
+fileflow-rpc.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
