@@ -1,8 +1,8 @@
 use crate::vault::VaultStore;
 use fileflow_catalog::{Catalog, CatalogError};
 use fileflow_core::{
-    DuplicateActionReport, DuplicateMember, IntegrityReport, LogicalFileId, LogicalFileView,
-    RevisionInfo, SearchHit,
+    BackupCreateReport, BackupRestoreReport, DuplicateActionReport, DuplicateMember,
+    IntegrityReport, LogicalFileId, LogicalFileView, RevisionInfo, SearchHit,
 };
 use fileflow_rpc::{Request, Response, WatcherStatus};
 use std::path::{Path, PathBuf};
@@ -20,16 +20,23 @@ pub struct FileFlowService {
     tx: mpsc::Sender<Command>,
     watcher: WatcherHandle,
     vault: Arc<VaultStore>,
+    data_home: PathBuf,
+    catalog_path: PathBuf,
 }
 
 impl FileFlowService {
-    pub fn spawn(catalog: Catalog, vault_root: PathBuf) -> Self {
+    pub fn spawn(catalog: Catalog, data_home: PathBuf) -> Self {
+        let catalog_path = data_home.join("catalog.sqlite");
+        let vault_root = data_home.join("vault");
+        let _ = std::fs::create_dir_all(&vault_root);
         let tx = spawn_writer(catalog);
         let (watcher, cmd_rx, snap) = WatcherHandle::pair();
         let svc = Self {
             tx,
             watcher,
             vault: Arc::new(VaultStore::new(vault_root)),
+            data_home,
+            catalog_path,
         };
         WatcherHandle::start(svc.clone(), cmd_rx, snap);
         let boot = svc.clone();
@@ -301,6 +308,34 @@ impl FileFlowService {
                     )
                     .await?;
                 Ok(Response::DuplicateAction { report })
+            }
+            Request::CreateBackup {
+                destination_path,
+                include_vault,
+            } => {
+                let report = self
+                    .create_backup(&destination_path, include_vault.unwrap_or(true))
+                    .await?;
+                Ok(Response::BackupCreated { report })
+            }
+            Request::VerifyBackup { backup_path } => Ok(Response::BackupVerified {
+                report: crate::backup::verify_backup(Path::new(&backup_path)),
+            }),
+            Request::RestoreBackup {
+                backup_path,
+                target_data_home,
+                confirm,
+                force,
+            } => {
+                let report = self
+                    .restore_backup(
+                        &backup_path,
+                        target_data_home.as_deref(),
+                        confirm,
+                        force.unwrap_or(false),
+                    )
+                    .await?;
+                Ok(Response::BackupRestored { report })
             }
         }
     }
@@ -696,6 +731,207 @@ impl FileFlowService {
         })
     }
 
+    async fn create_backup(
+        &self,
+        destination_path: &str,
+        include_vault: bool,
+    ) -> Result<BackupCreateReport, CatalogError> {
+        let dest = crate::backup::resolve_backup_path(Path::new(destination_path))?;
+        self.watcher.pause().await;
+        let staging = self.data_home.join(format!(
+            ".backup-staging-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let result = self
+            .create_backup_inner(&dest, include_vault, &staging)
+            .await;
+        let _ = std::fs::remove_dir_all(&staging);
+        self.watcher.resume().await;
+        result
+    }
+
+    async fn create_backup_inner(
+        &self,
+        dest: &Path,
+        include_vault: bool,
+        staging: &Path,
+    ) -> Result<BackupCreateReport, CatalogError> {
+        std::fs::create_dir_all(staging).map_err(|e| CatalogError::msg(e.to_string()))?;
+        let snap = staging.join("fileflow.db.snapshot");
+        self.call(|reply| Command::SnapshotTo {
+            dest: snap.clone(),
+            reply,
+        })
+        .await?;
+        let sql_path = staging.join("fileflow.sql");
+        let snap_clone = snap.clone();
+        tokio::task::spawn_blocking(move || {
+            let cat = fileflow_catalog::Catalog::open_readonly(&snap_clone)?;
+            cat.export_sql(&sql_path)
+        })
+        .await
+        .map_err(|e| CatalogError::msg(e.to_string()))??;
+
+        let mut notes = vec![
+            "SQLite snapshot used the backup API (not a naive hot copy).".into(),
+            "Watcher was paused for the snapshot.".into(),
+            "This package is FileFlow catalog/vault recovery, not a full disk image of user documents.".into(),
+        ];
+        let mut vault_objects = 0u64;
+        if include_vault {
+            let hashes = self.call(|reply| Command::BlobSha256s { reply }).await?;
+            vault_objects = crate::backup::copy_vault_objects(
+                self.vault.root(),
+                &hashes,
+                &staging.join("vault"),
+                &mut notes,
+            );
+        }
+        let staging = staging.to_path_buf();
+        let dest = dest.to_path_buf();
+        let source = self.data_home.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::backup::pack_backup(
+                &staging,
+                &dest,
+                &source,
+                include_vault,
+                vault_objects,
+                notes,
+            )
+        })
+        .await
+        .map_err(|e| CatalogError::msg(e.to_string()))?
+    }
+
+    async fn restore_backup(
+        &self,
+        backup_path: &str,
+        target_data_home: Option<&str>,
+        confirm: bool,
+        force: bool,
+    ) -> Result<BackupRestoreReport, CatalogError> {
+        if !confirm {
+            return Err(CatalogError::msg(
+                "RestoreBackup requires confirm=true (refuses to overwrite without confirmation)",
+            ));
+        }
+        let backup = PathBuf::from(backup_path);
+        let verify = crate::backup::verify_backup(&backup);
+        if !verify.ok {
+            return Err(CatalogError::msg(format!(
+                "backup verify failed: {}",
+                verify.failures.join("; ")
+            )));
+        }
+        let target = target_data_home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.data_home.clone());
+        let live = same_path(&target, &self.data_home);
+        let occupied = if live {
+            self.call(|reply| Command::LogicalFileCount { reply })
+                .await?
+                > 0
+                || crate::backup::target_has_user_state(&target)
+        } else {
+            crate::backup::target_has_user_state(&target)
+        };
+        if occupied && !force {
+            return Err(CatalogError::msg(format!(
+                "target data home already has catalog/vault data ({}); pass force=true with confirm to replace",
+                target.display()
+            )));
+        }
+
+        self.watcher.pause().await;
+        let staging = target.join(format!(
+            ".restore-staging-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(1)
+        ));
+        let result = self
+            .restore_backup_inner(&backup, &target, live, &staging)
+            .await;
+        let _ = std::fs::remove_dir_all(&staging);
+        if live {
+            match self.list_indexed_locations().await {
+                Ok(roots) => {
+                    for root in roots {
+                        self.watcher.add_root(root).await;
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err, "re-arm watcher after restore failed"),
+            }
+        }
+        self.watcher.resume().await;
+        result
+    }
+
+    async fn restore_backup_inner(
+        &self,
+        backup: &Path,
+        target: &Path,
+        live: bool,
+        staging: &Path,
+    ) -> Result<BackupRestoreReport, CatalogError> {
+        let backup = backup.to_path_buf();
+        let staging_owned = staging.to_path_buf();
+        let (vault_n, mut notes) = tokio::task::spawn_blocking(move || {
+            crate::backup::extract_restore(&backup, &staging_owned)
+        })
+        .await
+        .map_err(|e| CatalogError::msg(e.to_string()))??;
+
+        let snap = staging.join("catalog.sqlite");
+        if live {
+            self.call(|reply| Command::ReplaceFromSnapshot {
+                snapshot: snap,
+                live: self.catalog_path.clone(),
+                reply,
+            })
+            .await?;
+            let staged_vault = staging.join("vault");
+            if staged_vault.exists() {
+                let live_vault = self.data_home.join("vault");
+                if live_vault.exists() {
+                    let bak = self.data_home.join("vault.bak");
+                    let _ = std::fs::remove_dir_all(&bak);
+                    let _ = std::fs::rename(&live_vault, &bak);
+                }
+                std::fs::create_dir_all(live_vault.parent().unwrap_or(Path::new(".")))
+                    .map_err(|e| CatalogError::msg(e.to_string()))?;
+                std::fs::rename(&staged_vault, &live_vault)
+                    .or_else(|_| copy_dir(&staged_vault, &live_vault))
+                    .map_err(|e| CatalogError::msg(e.to_string()))?;
+            }
+            notes.push("live catalog connection reopened from snapshot".into());
+            notes.push("watcher re-armed from indexed_locations".into());
+        } else {
+            std::fs::create_dir_all(target).map_err(|e| CatalogError::msg(e.to_string()))?;
+            let dest_db = target.join("catalog.sqlite");
+            std::fs::copy(&snap, &dest_db).map_err(|e| CatalogError::msg(e.to_string()))?;
+            let staged_vault = staging.join("vault");
+            if staged_vault.exists() {
+                let dest_vault = target.join("vault");
+                let _ = std::fs::remove_dir_all(&dest_vault);
+                copy_dir(&staged_vault, &dest_vault)?;
+            }
+            notes.push("restored into target data home (restart service with FILEFLOW_DATA_HOME to use it, or restore into the live home)".into());
+        }
+
+        Ok(BackupRestoreReport {
+            ok: true,
+            target_data_home: target.display().to_string(),
+            restored_vault_objects: vault_n,
+            notes,
+        })
+    }
+
     async fn call<T>(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<T, CatalogError>>) -> Command,
@@ -708,4 +944,31 @@ impl FileFlowService {
         rx.await
             .map_err(|_| CatalogError::msg("catalog writer dropped reply"))?
     }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> Result<(), CatalogError> {
+    std::fs::create_dir_all(dst).map_err(|e| CatalogError::msg(e.to_string()))?;
+    for entry in walkdir::WalkDir::new(src)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
+        let to = dst.join(rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CatalogError::msg(e.to_string()))?;
+        }
+        std::fs::copy(entry.path(), &to).map_err(|e| CatalogError::msg(e.to_string()))?;
+    }
+    Ok(())
 }

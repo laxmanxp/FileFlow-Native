@@ -15,9 +15,8 @@ async fn find_exclusions_resolve_and_refuse_delete_all() {
     let dir = tempdir().unwrap();
     let sock = dir.path().join("fileflow.sock");
     let db = dir.path().join("catalog.sqlite");
-    let vault = dir.path().join("vault");
     let catalog = Catalog::open(&db).unwrap();
-    let service = FileFlowService::spawn(catalog, vault);
+    let service = FileFlowService::spawn(catalog, dir.path().to_path_buf());
     let sock_serve = sock.clone();
     tokio::spawn(async move {
         let _ = serve(&sock_serve, service).await;

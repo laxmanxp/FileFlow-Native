@@ -1,7 +1,8 @@
 //! Thin client stub: IPC only. Never opens the catalog.
 
 use fileflow_core::{
-    Config, DuplicateActionReport, DuplicateScan, LogicalFileId, LogicalFileView, SearchHit,
+    BackupCreateReport, BackupRestoreReport, BackupVerifyReport, Config, DuplicateActionReport,
+    DuplicateScan, LogicalFileId, LogicalFileView, SearchHit,
 };
 use fileflow_rpc::{connect, IndexReport, Request, Response, RpcConnection, TransportError};
 use thiserror::Error;
@@ -396,6 +397,65 @@ impl<S: AsyncRead + AsyncWrite + Unpin> FileFlowClient<S> {
             .await?
         {
             Response::DuplicateAction { report } => Ok(report),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn create_backup(
+        &mut self,
+        destination_path: &str,
+        include_vault: Option<bool>,
+    ) -> Result<BackupCreateReport, ClientError> {
+        match self
+            .conn
+            .call(&Request::CreateBackup {
+                destination_path: destination_path.to_string(),
+                include_vault,
+            })
+            .await?
+        {
+            Response::BackupCreated { report } => Ok(report),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn verify_backup(
+        &mut self,
+        backup_path: &str,
+    ) -> Result<BackupVerifyReport, ClientError> {
+        match self
+            .conn
+            .call(&Request::VerifyBackup {
+                backup_path: backup_path.to_string(),
+            })
+            .await?
+        {
+            Response::BackupVerified { report } => Ok(report),
+            Response::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Unexpected),
+        }
+    }
+
+    pub async fn restore_backup(
+        &mut self,
+        backup_path: &str,
+        target_data_home: Option<&str>,
+        confirm: bool,
+        force: Option<bool>,
+    ) -> Result<BackupRestoreReport, ClientError> {
+        match self
+            .conn
+            .call(&Request::RestoreBackup {
+                backup_path: backup_path.to_string(),
+                target_data_home: target_data_home.map(|s| s.to_string()),
+                confirm,
+                force,
+            })
+            .await?
+        {
+            Response::BackupRestored { report } => Ok(report),
             Response::Error { message } => Err(ClientError::Service(message)),
             _ => Err(ClientError::Unexpected),
         }

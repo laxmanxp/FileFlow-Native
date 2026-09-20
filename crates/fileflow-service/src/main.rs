@@ -22,6 +22,6 @@ async fn main() -> anyhow::Result<()> {
 
     let catalog = Catalog::open(&cfg.catalog_path())?;
     std::fs::create_dir_all(cfg.vault_root())?;
-    let service = FileFlowService::spawn(catalog, cfg.vault_root());
+    let service = FileFlowService::spawn(catalog, cfg.data_home.clone());
     serve(&cfg.socket, service).await
 }

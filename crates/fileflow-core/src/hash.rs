@@ -12,11 +12,16 @@ pub const HASH_BUFFER_SIZE: usize = 64 * 1024;
 /// Stream SHA-256 of a file. Returns (lowercase hex digest, size in bytes).
 pub fn hash_file(path: &Path) -> Result<(String, u64)> {
     let mut file = File::open(path)?;
+    hash_reader(&mut file)
+}
+
+/// Stream SHA-256 of any `Read`. Large inputs are never loaded whole.
+pub fn hash_reader(reader: &mut impl Read) -> Result<(String, u64)> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_BUFFER_SIZE];
     let mut size = 0u64;
     loop {
-        let n = file.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -26,8 +31,7 @@ pub fn hash_file(path: &Path) -> Result<(String, u64)> {
     Ok((hex::encode(hasher.finalize()), size))
 }
 
-#[cfg(test)]
-pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
@@ -47,7 +51,7 @@ mod tests {
         tmp.flush().unwrap();
         let (digest, size) = hash_file(tmp.path()).unwrap();
         assert_eq!(size, b"fileflow-hash-fixture".len() as u64);
-        assert_eq!(digest, hash_bytes(b"fileflow-hash-fixture"));
+        assert_eq!(digest, sha256_hex(b"fileflow-hash-fixture"));
         assert_eq!(digest.len(), 64);
     }
 
@@ -59,7 +63,7 @@ mod tests {
         tmp.flush().unwrap();
         let (digest, size) = hash_file(tmp.path()).unwrap();
         assert_eq!(size, chunk.len() as u64);
-        assert_eq!(digest, hash_bytes(&chunk));
+        assert_eq!(digest, sha256_hex(&chunk));
     }
 
     #[test]

@@ -117,6 +117,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MainTab {
+    Find,
+    Duplicates,
+    Backup,
+}
+
 struct FileFlowApp {
     rt: Runtime,
     client: Option<Arc<Mutex<FileFlowClient<Stream>>>>,
@@ -130,13 +137,18 @@ struct FileFlowApp {
     note_draft: String,
     todo_input: String,
     revisions: Vec<RevisionInfo>,
-    tab_duplicates: bool,
+    tab: MainTab,
     dup_exclude: bool,
     dup_min_size: String,
     dup_scan: Option<DuplicateScan>,
     dup_selected: Option<usize>,
     dup_pending: Option<(String, LogicalFileId, Vec<LogicalFileId>)>,
     dup_permanent: bool,
+    backup_dest: String,
+    backup_file: String,
+    include_vault: bool,
+    restore_force: bool,
+    restore_pending: bool,
 }
 
 impl FileFlowApp {
@@ -154,13 +166,18 @@ impl FileFlowApp {
             note_draft: String::new(),
             todo_input: String::new(),
             revisions: Vec::new(),
-            tab_duplicates: false,
+            tab: MainTab::Find,
             dup_exclude: true,
             dup_min_size: String::new(),
             dup_scan: None,
             dup_selected: None,
             dup_pending: None,
             dup_permanent: false,
+            backup_dest: String::new(),
+            backup_file: String::new(),
+            include_vault: true,
+            restore_force: false,
+            restore_pending: false,
         };
         app.reconnect();
         app
@@ -311,7 +328,7 @@ impl FileFlowApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("FileFlow");
-                ui.label("Add → Find → Open → Edit metadata → Duplicates");
+                ui.label("Add → Find → Open → Edit metadata → Duplicates → Backup");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Reconnect").clicked() {
                         self.reconnect();
@@ -350,8 +367,9 @@ impl FileFlowApp {
                 }
             });
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab_duplicates, false, "Find");
-                ui.selectable_value(&mut self.tab_duplicates, true, "Duplicates");
+                ui.selectable_value(&mut self.tab, MainTab::Find, "Find");
+                ui.selectable_value(&mut self.tab, MainTab::Duplicates, "Duplicates");
+                ui.selectable_value(&mut self.tab, MainTab::Backup, "Backup");
             });
             ui.label(&self.status);
             ui.add_space(4.0);
@@ -370,8 +388,12 @@ impl FileFlowApp {
         let mut export_rev: Option<i64> = None;
         let mut verify_rev: Option<i64> = None;
 
-        if self.tab_duplicates {
+        if self.tab == MainTab::Duplicates {
             self.ui_duplicates(ctx);
+            return;
+        }
+        if self.tab == MainTab::Backup {
+            self.ui_backup(ctx);
             return;
         }
 
@@ -840,6 +862,155 @@ impl FileFlowApp {
                 self.run_duplicate_scan();
             }
             Err(err) => self.status = format!("Resolve failed: {err}"),
+        }
+    }
+
+    fn ui_backup(&mut self, ctx: &egui::Context) {
+        let mut create = false;
+        let mut verify = false;
+        let mut ask_restore = false;
+        let mut do_restore = false;
+        let mut cancel_restore = false;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Backup / recovery");
+            ui.label("Creates a .ffbackup of FileFlow catalog (+ vault blobs if enabled). This is not a full disk image of your documents.");
+            ui.checkbox(&mut self.include_vault, "Include vault content objects (default on)");
+            ui.horizontal(|ui| {
+                ui.label("Destination folder or .ffbackup path");
+                ui.add(egui::TextEdit::singleline(&mut self.backup_dest).desired_width(420.0));
+                if ui.button("Browse…").clicked() {
+                    if let Some(path) = pick_folder() {
+                        self.backup_dest = path;
+                    }
+                }
+                if ui.button("Create backup").clicked() {
+                    create = true;
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(".ffbackup file");
+                ui.add(egui::TextEdit::singleline(&mut self.backup_file).desired_width(420.0));
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Verify backup").clicked() {
+                    verify = true;
+                }
+                ui.checkbox(&mut self.restore_force, "Force replace existing catalog/vault in the service data home");
+            });
+            if ui.button("Restore…").clicked() {
+                ask_restore = true;
+            }
+            if self.restore_pending {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 40, 40),
+                    "Confirm restore: this replaces FileFlow catalog/vault in the target data home. User files on disk are not overwritten unless they were vault blobs in the package.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel_restore = true;
+                    }
+                    if ui.button("Restore now").clicked() {
+                        do_restore = true;
+                    }
+                });
+            }
+            ui.separator();
+            ui.label(&self.status);
+        });
+        if create {
+            self.run_create_backup();
+        }
+        if verify {
+            self.run_verify_backup();
+        }
+        if ask_restore {
+            self.restore_pending = true;
+        }
+        if cancel_restore {
+            self.restore_pending = false;
+        }
+        if do_restore {
+            self.restore_pending = false;
+            self.run_restore_backup();
+        }
+    }
+
+    fn run_create_backup(&mut self) {
+        let Some(client) = self.client.clone() else {
+            self.status = "Not connected.".into();
+            return;
+        };
+        let dest = self.backup_dest.clone();
+        if dest.trim().is_empty() {
+            self.status = "Choose a destination folder (secondary drive path is fine).".into();
+            return;
+        }
+        let include = self.include_vault;
+        match self.rt.block_on(async {
+            let mut c = client.lock().await;
+            c.create_backup(&dest, Some(include)).await
+        }) {
+            Ok(report) => {
+                self.backup_file = report.path.clone();
+                self.status = format!(
+                    "Backup written to {} ({} bytes, vault objects {}). Watcher was paused during the snapshot.",
+                    report.path, report.bytes, report.vault_objects
+                );
+            }
+            Err(err) => self.status = format!("Backup failed: {err}"),
+        }
+    }
+
+    fn run_verify_backup(&mut self) {
+        let Some(client) = self.client.clone() else {
+            self.status = "Not connected.".into();
+            return;
+        };
+        let path = self.backup_file.clone();
+        if path.trim().is_empty() {
+            self.status = "Set the .ffbackup path to verify.".into();
+            return;
+        }
+        match self.rt.block_on(async {
+            let mut c = client.lock().await;
+            c.verify_backup(&path).await
+        }) {
+            Ok(report) => {
+                self.status = if report.ok {
+                    format!("Verify ok: {}", report.path)
+                } else {
+                    format!("Verify FAILED: {}", report.failures.join("; "))
+                };
+            }
+            Err(err) => self.status = format!("Verify failed: {err}"),
+        }
+    }
+
+    fn run_restore_backup(&mut self) {
+        let Some(client) = self.client.clone() else {
+            self.status = "Not connected.".into();
+            return;
+        };
+        let path = self.backup_file.clone();
+        if path.trim().is_empty() {
+            self.status = "Set the .ffbackup path to restore.".into();
+            return;
+        }
+        let force = self.restore_force;
+        match self.rt.block_on(async {
+            let mut c = client.lock().await;
+            c.restore_backup(&path, None, true, Some(force)).await
+        }) {
+            Ok(report) => {
+                self.status = format!(
+                    "Restored into {} (vault objects {}). {}",
+                    report.target_data_home,
+                    report.restored_vault_objects,
+                    report.notes.join(" ")
+                );
+            }
+            Err(err) => self.status = format!("Restore failed: {err}"),
         }
     }
 }

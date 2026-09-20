@@ -13,6 +13,7 @@ use crate::{CatalogError, Result};
 /// Persistent catalog. Caller (FileFlowService) serializes writes.
 pub struct Catalog {
     conn: Connection,
+    path: Option<std::path::PathBuf>,
 }
 
 impl Catalog {
@@ -22,13 +23,28 @@ impl Catalog {
         }
         let conn = Connection::open(path)?;
         migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: Some(path.to_path_buf()),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, path: None })
+    }
+
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self {
+            conn,
+            path: Some(path.to_path_buf()),
+        })
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     pub fn resolve_path(&self, path: &str) -> Result<Option<LogicalFileId>> {
@@ -762,6 +778,86 @@ impl Catalog {
         }
         Ok(unused)
     }
+
+    /// Consistent snapshot via SQLite backup API (not a naive hot file copy).
+    pub fn snapshot_to(&self, dest: &Path) -> Result<()> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CatalogError::msg(e.to_string()))?;
+        }
+        if dest.exists() {
+            std::fs::remove_file(dest).map_err(|e| CatalogError::msg(e.to_string()))?;
+        }
+        let mut dst = Connection::open(dest)?;
+        {
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut dst)?;
+            backup
+                .run_to_completion(32, std::time::Duration::from_millis(1), None)
+                .map_err(|e| CatalogError::msg(e.to_string()))?;
+        }
+        dst.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        Ok(())
+    }
+
+    pub fn integrity_ok(&self) -> Result<bool> {
+        let msg: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(msg.eq_ignore_ascii_case("ok"))
+    }
+
+    pub fn logical_file_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM logical_files", [], |row| row.get(0))?;
+        Ok(n as u64)
+    }
+
+    pub fn blob_sha256s(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT sha256 FROM content_objects WHERE blob_present = 1 ORDER BY sha256")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn export_sql(&self, dest: &Path) -> Result<()> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CatalogError::msg(e.to_string()))?;
+        }
+        let mut out = std::fs::File::create(dest).map_err(|e| CatalogError::msg(e.to_string()))?;
+        dump_sql(&self.conn, &mut out)
+    }
+
+    /// Close the live connection, replace the on-disk catalog, and reopen.
+    pub fn replace_from_snapshot(&mut self, snapshot: &Path, live_path: &Path) -> Result<()> {
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        let placeholder = Connection::open_in_memory()?;
+        let old = std::mem::replace(&mut self.conn, placeholder);
+        drop(old);
+        for suffix in ["", "-wal", "-shm"] {
+            let p = {
+                let mut p = live_path.as_os_str().to_os_string();
+                p.push(suffix);
+                std::path::PathBuf::from(p)
+            };
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        if let Some(parent) = live_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CatalogError::msg(e.to_string()))?;
+        }
+        std::fs::copy(snapshot, live_path).map_err(|e| CatalogError::msg(e.to_string()))?;
+        let conn = Connection::open(live_path)?;
+        migrate(&conn)?;
+        self.conn = conn;
+        self.path = Some(live_path.to_path_buf());
+        Ok(())
+    }
 }
 
 fn now_secs() -> i64 {
@@ -808,6 +904,78 @@ fn normalize_prefix(prefix: &str) -> String {
 fn path_under_prefix(path: &str, prefix: &str) -> bool {
     let path = path.replace('\\', "/");
     path == *prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn dump_sql(conn: &Connection, out: &mut impl std::io::Write) -> Result<()> {
+    writeln!(out, "BEGIN TRANSACTION;").map_err(|e| CatalogError::msg(e.to_string()))?;
+    let mut stmt = conn.prepare(
+        "SELECT sql FROM sqlite_master
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+         ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name",
+    )?;
+    let sqls: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    for sql in sqls {
+        writeln!(out, "{sql};").map_err(|e| CatalogError::msg(e.to_string()))?;
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let tables: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    for table in tables {
+        if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let query = format!("SELECT * FROM {table}");
+        let mut stmt = conn.prepare(&query)?;
+        let col_count = stmt.column_count();
+        let cols: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).unwrap_or("c").to_string())
+            .collect();
+        let col_list = cols.join(", ");
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let mut vals = Vec::new();
+            for i in 0..col_count {
+                vals.push(sql_literal(row.get_ref(i)?));
+            }
+            writeln!(
+                out,
+                "INSERT INTO {table} ({col_list}) VALUES ({});",
+                vals.join(", ")
+            )
+            .map_err(|e| CatalogError::msg(e.to_string()))?;
+        }
+    }
+    writeln!(out, "COMMIT;").map_err(|e| CatalogError::msg(e.to_string()))?;
+    Ok(())
+}
+
+fn sql_literal(v: rusqlite::types::ValueRef<'_>) -> String {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => "NULL".into(),
+        ValueRef::Integer(n) => n.to_string(),
+        ValueRef::Real(f) => {
+            if f.is_finite() {
+                f.to_string()
+            } else {
+                "NULL".into()
+            }
+        }
+        ValueRef::Text(t) => {
+            let s = String::from_utf8_lossy(t).replace('\'', "''");
+            format!("'{s}'")
+        }
+        ValueRef::Blob(b) => format!("X'{}'", hex::encode(b)),
+    }
 }
 
 #[cfg(test)]
@@ -1025,5 +1193,24 @@ mod tests {
             .iter()
             .all(|m| !m.path.contains("node_modules")));
         assert_eq!(filtered.reclaimable_bytes, 4);
+    }
+
+    #[test]
+    fn snapshot_and_sql_export_roundtrip() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("catalog.sqlite");
+        let mut cat = Catalog::open(&db).unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, b"hi").unwrap();
+        cat.upsert_indexed(f.to_str().unwrap(), "ab", 2).unwrap();
+        let snap = dir.path().join("fileflow.db.snapshot");
+        cat.snapshot_to(&snap).unwrap();
+        let sql = dir.path().join("fileflow.sql");
+        cat.export_sql(&sql).unwrap();
+        let dump = std::fs::read_to_string(&sql).unwrap();
+        assert!(dump.contains("INSERT INTO"));
+        let opened = Catalog::open(&snap).unwrap();
+        assert!(opened.integrity_ok().unwrap());
+        assert_eq!(opened.logical_file_count().unwrap(), 1);
     }
 }

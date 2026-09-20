@@ -8,6 +8,7 @@ description = "SQLite catalog owned exclusively by FileFlowService"
 
 [dependencies]
 fileflow-core.workspace = true
+hex.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 

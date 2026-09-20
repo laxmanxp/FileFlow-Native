@@ -119,6 +119,21 @@ pub enum Command {
         sha256: String,
         reply: Reply<Vec<fileflow_core::DuplicateMember>>,
     },
+    SnapshotTo {
+        dest: std::path::PathBuf,
+        reply: Reply<()>,
+    },
+    BlobSha256s {
+        reply: Reply<Vec<String>>,
+    },
+    LogicalFileCount {
+        reply: Reply<u64>,
+    },
+    ReplaceFromSnapshot {
+        snapshot: std::path::PathBuf,
+        live: std::path::PathBuf,
+        reply: Reply<()>,
+    },
 }
 
 pub fn spawn_writer(mut catalog: Catalog) -> mpsc::Sender<Command> {
@@ -229,6 +244,22 @@ pub fn spawn_writer(mut catalog: Catalog) -> mpsc::Sender<Command> {
                 }
                 Command::MembersForHash { sha256, reply } => {
                     let _ = reply.send(catalog.current_members_for_hash(&sha256));
+                }
+                Command::SnapshotTo { dest, reply } => {
+                    let _ = reply.send(catalog.snapshot_to(&dest));
+                }
+                Command::BlobSha256s { reply } => {
+                    let _ = reply.send(catalog.blob_sha256s());
+                }
+                Command::LogicalFileCount { reply } => {
+                    let _ = reply.send(catalog.logical_file_count());
+                }
+                Command::ReplaceFromSnapshot {
+                    snapshot,
+                    live,
+                    reply,
+                } => {
+                    let _ = reply.send(catalog.replace_from_snapshot(&snapshot, &live));
                 }
             }
         }

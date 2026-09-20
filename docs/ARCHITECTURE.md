@@ -93,6 +93,29 @@ Exclusion patterns are **path segments** (directory names), not filename substri
 
 The service performs filesystem removal, then tombstones the path. Prefer trash/recycle; if that fails, `confirm_permanent=true` unlinks permanently. The kept file (and its vault history) is not modified. There is no scheduled or “clean all” path.
 
+## Backup / recovery (`.ffbackup`)
+
+FileFlowService writes a ZIP-compatible `.ffbackup`. A secondary drive is just another destination path. The package recovers **FileFlow catalog + optional vault blobs**, not a disk image of ordinary user documents (those bytes are included only if they were vaulted).
+
+Layout:
+
+```
+FileFlow-Recovery-YYYYMMDD-HHMMSS.ffbackup
+  fileflow.db.snapshot   # SQLite backup API snapshot (not a naive hot copy)
+  fileflow.sql           # portable SQL export
+  manifest.json          # version, created_at, source data home, components, include_vault
+  checksums.sha256       # SHA-256 of every member except this file
+  vault/objects/…        # present when include_vault is true (default)
+```
+
+The watcher is paused for the snapshot. Streaming copy into the zip; vault objects are not loaded fully into RAM.
+
+| RPC | Behavior |
+| --- | --- |
+| `CreateBackup { destination_path, include_vault? }` | If `destination_path` is a directory, write a timestamped `FileFlow-Recovery-*.ffbackup` there. If it ends in `.ffbackup`, use that file path. |
+| `VerifyBackup` | Zip members present, checksums match, manifest parses, snapshot `PRAGMA integrity_check`. |
+| `RestoreBackup { backup_path, target_data_home?, confirm, force? }` | Requires `confirm=true`. Default target is the live `FILEFLOW_DATA_HOME`. Refuses a non-empty catalog/vault without `force=true`. Live restore reopens SQLite and re-arms the watcher from `indexed_locations`. |
+
 ## IPC
 
 Client/server **stub** pattern:
@@ -112,4 +135,4 @@ fileflow-client  (same stub)
 
 ## Out of scope (v1)
 
-Encrypted vault, cloud backup/`.ffbackup`, Explorer shell extension/NSIS, Office/CAD preview workers, fuzzy/near-duplicate detection, automatic cleanup schedules, email transport.
+Encrypted vault, encrypted/email/cloud transport of backups, Explorer shell extension/NSIS, Office/CAD preview workers, fuzzy/near-duplicate detection, automatic backup schedules, full OS/disk imaging.

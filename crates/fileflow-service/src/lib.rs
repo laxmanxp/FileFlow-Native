@@ -1,6 +1,7 @@
 //! FileFlowService: sole authority over catalog state.
 
 mod actor;
+mod backup;
 mod handle;
 mod indexer;
 mod server;

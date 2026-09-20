@@ -1,6 +1,6 @@
 use fileflow_core::{
-    DuplicateActionReport, DuplicateScan, IntegrityReport, LogicalFileId, LogicalFileView,
-    RevisionInfo, SearchHit,
+    BackupCreateReport, BackupRestoreReport, BackupVerifyReport, DuplicateActionReport,
+    DuplicateScan, IntegrityReport, LogicalFileId, LogicalFileView, RevisionInfo, SearchHit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +108,19 @@ pub enum Request {
         confirm_permanent: bool,
         allow_delete_last: bool,
     },
+    CreateBackup {
+        destination_path: String,
+        include_vault: Option<bool>,
+    },
+    VerifyBackup {
+        backup_path: String,
+    },
+    RestoreBackup {
+        backup_path: String,
+        target_data_home: Option<String>,
+        confirm: bool,
+        force: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +171,15 @@ pub enum Response {
     },
     DuplicateAction {
         report: DuplicateActionReport,
+    },
+    BackupCreated {
+        report: BackupCreateReport,
+    },
+    BackupVerified {
+        report: BackupVerifyReport,
+    },
+    BackupRestored {
+        report: BackupRestoreReport,
     },
     Ok,
     Error {

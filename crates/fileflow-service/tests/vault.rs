@@ -18,7 +18,7 @@ async fn vault_store_revision_restore_verify_and_rename() {
     let db = dir.path().join("catalog.sqlite");
     let vault = dir.path().join("vault");
     let catalog = Catalog::open(&db).unwrap();
-    let service = FileFlowService::spawn(catalog, vault.clone());
+    let service = FileFlowService::spawn(catalog, dir.path().to_path_buf());
     let sock_serve = sock.clone();
     tokio::spawn(async move {
         let _ = serve(&sock_serve, service).await;
